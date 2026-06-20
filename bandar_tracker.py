@@ -659,11 +659,13 @@ def track_once():
     if not tracked_wallets:
         log("Tidak ada wallet yang di-track.", "⚠️ ")
         return
+    log(f"🎯 Track: memeriksa {len(tracked_wallets)} wallet...", "🎯 ")
     for addr, label in list(tracked_wallets.items()):
         try:
             poll_wallet(addr, label if isinstance(label, str) else label.get("label", addr[:8]))
         except Exception as e:
             log(f"Error polling {addr[:8]}: {e}", "❌ ")
+    log(f"🎯 Track selesai — {len(tracked_wallets)} wallets diperiksa", "🎯 ")
 
 def track_loop():
     if not tracked_wallets:
@@ -854,12 +856,15 @@ def discover_smart_wallets_from_token(token: dict) -> list[str]:
         return []
 
     log(f"🔎 Discover dari ${info['symbol']} ({mint[:8]}...) liq=${info['liq']:.0f}", "🧠 ")
+    tg(f"🔎 Discover dari <b>${esc(info['symbol'])}</b> — liq ${info['liq']:,.0f}")
     buyers = get_early_buyers(mint, top_n=5)
     if not buyers:
+        tg(f"⏭️ <b>${esc(info['symbol'])}</b> — tidak ada early buyer")
         return []
 
+    tg(f"👥 <b>${esc(info['symbol'])}</b> — {len(buyers)} early buyer ditemukan, menganalisis...")
     good_wallets = []
-    for addr, sol_spent in buyers:
+    for i, (addr, sol_spent) in enumerate(buyers, 1):
         if addr in tracked_wallets or addr in discovered_set:
             continue
         if len(tracked_wallets) >= DISCOVER_MAX_WALLETS:
@@ -867,6 +872,7 @@ def discover_smart_wallets_from_token(token: dict) -> list[str]:
             break
 
         log(f"   Analisis {addr[:10]}... (spent {sol_spent:.2f} SOL)", "🧠 ")
+        tg(f"⏳ Analisis wallet {i}/{len(buyers)}: <code>{esc(addr[:10])}...</code> (spent {sol_spent:.2f} SOL)")
         hist = analyze_wallet_history(addr)
         wr   = hist["win_rate"]
         wins = hist["wins"]
@@ -911,17 +917,21 @@ def auto_discover_once():
     try:
         pumped = fetch_pumped_tokens(limit=20)
         log(f"📡 {len(pumped)} pumped token ditemukan", "🧠 ")
+        tg(f"📡 Auto-Discover: {len(pumped)} pumped token ditemukan")
         new_wallets_total = 0
-        for token in pumped:
+        for i, token in enumerate(pumped, 1):
             if token["mint"] in seen_mints:
                 continue
             seen_mints.add(token["mint"])
+            log(f"🔎 Token {i}/{len(pumped)}: {token['mint'][:8]}...", "🧠 ")
             found = discover_smart_wallets_from_token(token)
             new_wallets_total += len(found)
         if new_wallets_total:
             log(f"🧠 Siklus selesai — {new_wallets_total} wallet baru ditambahkan", "🧠 ")
+            tg(f"✅ <b>Discover selesai</b> — {new_wallets_total} wallet baru ditambahkan")
         else:
             log(f"🧠 Siklus selesai — tidak ada wallet baru", "🧠 ")
+            tg(f"✅ <b>Discover selesai</b> — tidak ada wallet baru")
     except Exception as e:
         log(f"Error di discover: {e}", "❌ ")
 
@@ -1102,6 +1112,8 @@ def run_loop(mode: str):
 
         cycle_count += 1
         log(f"🔄 Cycle #{cycle_count} ({elapsed/3600:.2f}h elapsed)")
+        cycle_start = time.time()
+        tg(f"🔄 <b>Cycle #{cycle_count}</b> — {elapsed/3600:.1f}h elapsed, menjalankan mode {mode}...")
 
         if mode == "2":
             for addr in tracked_wallets:
@@ -1120,6 +1132,9 @@ def run_loop(mode: str):
             auto_scan_once()
 
         save_seen()
+
+        cycle_duration = time.time() - cycle_start
+        tg(f"✅ <b>Cycle #{cycle_count}</b> selesai dalam {cycle_duration/60:.1f} menit")
 
         if time.time() - start_time >= max_duration:
             break
