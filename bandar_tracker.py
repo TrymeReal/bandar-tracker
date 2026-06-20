@@ -1009,8 +1009,61 @@ Mode:
   [a] Add wallet ke tracker
   [l] List tracked wallets
   [q] Quit
+
+CLI (untuk GitHub Actions / cron):
+  python bandar_tracker.py --ci --mode 7
 """
 
+# ══════════════════════════════════════════════
+# CI MODE — satu siklus lalu exit (untuk cron)
+# ══════════════════════════════════════════════
+
+async def ci_run(mode: str, client: httpx.AsyncClient):
+    """
+    Jalankan SATU siklus (bukan loop) lalu return.
+    Cocok untuk GitHub Actions yang jalan tiap 15 menit.
+    """
+    log(f"CI mode aktif — mode={mode}")
+
+    if mode in ("1", "3"):
+        tokens   = await fetch_new_tokens(client)
+        new_ones = [t for t in tokens if t["mint"] not in seen_mints]
+        log(f"{len(new_ones)} token baru")
+        for t in new_ones:
+            seen_mints.add(t["mint"])
+        await asyncio.gather(
+            *[process_token(t, client) for t in new_ones],
+            return_exceptions=True,
+        )
+
+    if mode in ("2", "3", "5", "7"):
+        if tracked_wallets:
+            tasks = [
+                poll_wallet(addr, label, client)
+                for addr, label in list(tracked_wallets.items())
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            log("Tidak ada wallet di-track.", "⚠️ ")
+
+    if mode in ("6", "7"):
+        pumped = await fetch_pumped_tokens(client)
+        new    = [t for t in pumped if t["mint"] not in seen_mints]
+        for t in new:
+            seen_mints.add(t["mint"])
+        await asyncio.gather(
+            *[discover_from_token(t, client) for t in new],
+            return_exceptions=True,
+        )
+
+    save_seen()
+    save_wallets()
+    log("CI siklus selesai ✅")
+
+
+# ══════════════════════════════════════════════
+# INTERACTIVE MENU
+# ══════════════════════════════════════════════
 
 async def add_wallet_interactive():
     addr  = input("Wallet address: ").strip()
@@ -1023,91 +1076,88 @@ async def add_wallet_interactive():
         log("Address tidak valid.", "❌ ")
 
 
+async def run_mode(c: str, client: httpx.AsyncClient):
+    """Jalankan mode tertentu dalam loop (untuk interactive/lokal)."""
+    if c == "1":
+        await tg("🔍 <b>Bandar Tracker aktif</b> — Auto-scan mode")
+        await auto_scan_loop(client)
+    elif c == "2":
+        if not tracked_wallets:
+            await add_wallet_interactive()
+        await tg(f"🎯 <b>Bandar Tracker aktif</b> — Tracking {len(tracked_wallets)} wallets")
+        await track_loop(client)
+    elif c == "3":
+        await tg(f"🚀 <b>Full mode</b> — {len(tracked_wallets)} wallets + auto-scan")
+        await asyncio.gather(auto_scan_loop(client), track_loop(client))
+    elif c == "4":
+        await tg("⚡ <b>WebSocket scan aktif</b>")
+        await ws_scan_loop(client)
+    elif c == "5":
+        await tg("⚡ <b>WebSocket + Track aktif</b>")
+        await asyncio.gather(ws_scan_loop(client), track_loop(client))
+    elif c == "6":
+        await tg("🧠 <b>Auto-Discover aktif</b>")
+        await auto_discover_loop(client)
+    elif c == "7":
+        await tg("🧠 <b>Full mode + Discover</b>")
+        await asyncio.gather(auto_discover_loop(client), track_loop(client))
+    else:
+        print("Pilihan tidak dikenal.")
+
+
 async def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Solana Bandar Tracker")
+    parser.add_argument("wallet",   nargs="?",       help="Wallet address (opsional, langsung track)")
+    parser.add_argument("--ci",     action="store_true", help="CI mode: satu siklus lalu exit")
+    parser.add_argument("--mode",   default="7",     help="Mode 1-7 (default: 7)")
+    args = parser.parse_args()
+
     # Validasi config
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌  TG_TOKEN dan TG_CHAT_ID wajib diisi di .env!")
+        print("❌  TG_TOKEN dan TG_CHAT_ID wajib diisi di .env atau environment variable!")
         sys.exit(1)
 
     load_wallets()
     load_seen()
 
-    # CLI arg: langsung track wallet spesifik
-    if len(sys.argv) > 1:
-        addr = sys.argv[1].strip()
+    # Kalau ada wallet di CLI arg, tambahkan dulu
+    if args.wallet and len(args.wallet) >= 32:
+        addr  = args.wallet.strip()
         label = f"CLI_{addr[:8]}"
         tracked_wallets[addr] = label
         save_wallets()
+        log(f"Wallet dari CLI ditambahkan: {label}")
 
-    print(BANNER)
+    init_notif(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_THREAD)
 
-    while True:
-        c = input(">> ").strip().lower()
+    async with httpx.AsyncClient() as client:
+        await get_sol_price(client)
 
-        if c == "q":
-            save_seen()
-            print("Bye!")
-            break
+        # ── CI MODE (GitHub Actions / cron) ──
+        if args.ci:
+            await ci_run(args.mode, client)
+            return
 
-        elif c == "l":
-            if tracked_wallets:
-                for a, lbl in tracked_wallets.items():
-                    print(f"  {lbl:30s}  {a}")
+        # ── INTERACTIVE MODE (lokal) ──
+        print(BANNER)
+        while True:
+            c = input(">> ").strip().lower()
+            if c == "q":
+                save_seen()
+                print("Bye!")
+                break
+            elif c == "l":
+                if tracked_wallets:
+                    for a, lbl in tracked_wallets.items():
+                        print(f"  {lbl:30s}  {a}")
+                else:
+                    print("  (kosong)")
+            elif c == "a":
+                await add_wallet_interactive()
             else:
-                print("  (kosong)")
-            continue
-
-        elif c == "a":
-            await add_wallet_interactive()
-            continue
-
-        # Semua mode butuh async client + notif queue
-        init_notif(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_THREAD)
-
-        async with httpx.AsyncClient() as client:
-            await get_sol_price(client)
-
-            if c == "1":
-                await tg("🔍 <b>Bandar Tracker aktif</b> — Auto-scan mode")
-                await auto_scan_loop(client)
-
-            elif c == "2":
-                if not tracked_wallets:
-                    await add_wallet_interactive()
-                await tg(f"🎯 <b>Bandar Tracker aktif</b> — Tracking {len(tracked_wallets)} wallets")
-                await track_loop(client)
-
-            elif c == "3":
-                await tg(f"🚀 <b>Full mode</b> — {len(tracked_wallets)} wallets + auto-scan")
-                await asyncio.gather(
-                    auto_scan_loop(client),
-                    track_loop(client),
-                )
-
-            elif c == "4":
-                await tg("⚡ <b>WebSocket scan aktif</b>")
-                await ws_scan_loop(client)
-
-            elif c == "5":
-                await tg("⚡ <b>WebSocket + Track aktif</b>")
-                await asyncio.gather(
-                    ws_scan_loop(client),
-                    track_loop(client),
-                )
-
-            elif c == "6":
-                await tg("🧠 <b>Auto-Discover aktif</b>")
-                await auto_discover_loop(client)
-
-            elif c == "7":
-                await tg("🧠 <b>Full mode + Discover</b>")
-                await asyncio.gather(
-                    auto_discover_loop(client),
-                    track_loop(client),
-                )
-
-            else:
-                print("Pilihan tidak dikenal.")
+                await run_mode(c, client)
 
 
 if __name__ == "__main__":
