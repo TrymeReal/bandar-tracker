@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════╗
-║        🐋 SOLANA BANDAR TRACKER v2          ║
+║        🐋 SOLANA BANDAR TRACKER v3          ║
 ║   Auto-scan token baru + Track whale wallet  ║
 ╚══════════════════════════════════════════════╝
 
@@ -10,10 +10,7 @@ MODE:
 
 SETUP:
   pip install requests websocket-client
-  Isi config di bawah (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
-
-OPTIONAL (lebih cepat):
-  Daftar Helius gratis di helius.dev → isi HELIUS_API_KEY
+  Isi .env (TG_TOKEN, TG_CHAT_ID, HELIUS_API_KEY, GMGN_API_KEY)
 """
 
 import json, time, sys, os, threading, requests, websocket
@@ -38,56 +35,48 @@ TELEGRAM_CHAT_ID = _env.get("TG_CHAT_ID") or os.environ.get("TG_CHAT_ID", "")
 TELEGRAM_THREAD  = int(_env.get("TG_THREAD") or os.environ.get("TG_THREAD") or "0")
 
 HELIUS_API_KEY   = _env.get("HELIUS_API_KEY") or os.environ.get("HELIUS_API_KEY", "")
+GMGN_API_KEY     = _env.get("GMGN_API_KEY") or os.environ.get("GMGN_API_KEY", "")
 RPC_FALLBACK     = "https://api.mainnet-beta.solana.com"
 
 # Mode auto-scan
-SCAN_INTERVAL    = 15                   # detik antar scan
-MIN_LIQUIDITY    = 1000                 # min liquidity USD buat diproses
-ALERT_SCORE      = 50                   # min score buat kirim alert (0-100)
-MIN_BANDAR_SOL   = 0.5                  # min SOL yg dipake bandar (filter sniper kecil)
+SCAN_INTERVAL    = 15
+MIN_LIQUIDITY    = 1000
+ALERT_SCORE      = 50
+MIN_BANDAR_SOL   = 0.5
 
 # Mode track wallet
-TRACK_INTERVAL   = 10                   # detik antar poll
-MIN_BUY_USD      = 5000                 # min buy dalam USD buat notif
+TRACK_INTERVAL   = 10
+MIN_BUY_USD      = 5000
 
 # Mode auto-discover smart money
-DISCOVER_INTERVAL   = 60               # detik antar discover cycle
-DISCOVER_MIN_WINRATE = 0.60            # min win rate (60%) buat auto-add
-DISCOVER_MIN_TOKENS  = 3               # min token yang pernah early-entry
-DISCOVER_SCORE_MIN   = 60             # min score per token buat dihitung "win"
-DISCOVER_MAX_WALLETS = 50              # max wallet yang di-track sekaligus
-PUMPED_MIN_LIQ       = 5_000          # min liquidity token yang dianggap "pumped"
-PUMPED_MIN_CHANGE    = 50.0           # min % price change buat dianggap pumped
+DISCOVER_INTERVAL    = 60
+DISCOVER_MIN_WINRATE = 0.60
+DISCOVER_MIN_TOKENS  = 3
+DISCOVER_MAX_WALLETS = 50
+PUMPED_MIN_LIQ       = 5_000
 
-# Wallet preset yang mau di-track (bisa diisi langsung atau via CLI)
-PRESET_WALLETS   = {
-    # "AaBbCc...": "nama label",
-}
+PRESET_WALLETS = {}
 
-# Mint yang harus di-skip (bukan token biasa)
 SKIP_MINTS = {
-    "So11111111111111111111111111111111111111112",   # Wrapped SOL
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", # USDC
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
-    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  # mSOL
-    "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y68YB",  # stSOL
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+    "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y68YB",
 }
 # ══════════════════════════════════════════════
 
 # ── State global ──────────────────────────────
-tracked_wallets  = dict(PRESET_WALLETS)
-seen_sigs        = set()
-seen_mints       = set()
-token_cache      = {}
-_sol_price       = 150.0
-DATA_FILE        = os.path.join(os.path.dirname(__file__), "wallets.json")
-SEEN_SIGS_FILE   = os.path.join(os.path.dirname(__file__), "seen_sigs.json")
-SEEN_MINTS_FILE  = os.path.join(os.path.dirname(__file__), "seen_mints.json")
-MODE_FILE        = os.path.join(os.path.dirname(__file__), "mode.json")
-
-# State untuk auto-discover
-wallet_history   = {}   # { wallet_addr: [{"mint":..., "score":..., "pumped":bool}, ...] }
-discovered_set   = set()  # wallet yang sudah di-discover (hindari duplikat notif)
+tracked_wallets = dict(PRESET_WALLETS)
+seen_sigs       = set()
+seen_mints      = set()
+token_cache     = {}
+_sol_price      = 150.0
+DATA_FILE       = os.path.join(os.path.dirname(__file__), "wallets.json")
+SEEN_SIGS_FILE  = os.path.join(os.path.dirname(__file__), "seen_sigs.json")
+SEEN_MINTS_FILE = os.path.join(os.path.dirname(__file__), "seen_mints.json")
+MODE_FILE       = os.path.join(os.path.dirname(__file__), "mode.json")
+discovered_set  = set()
 
 # ══════════════════════════════════════════════
 # UTILS
@@ -229,7 +218,6 @@ def listen_tg_commands():
                     if mode_raw not in ("1", "2", "3", "4", "5", "6", "7"):
                         tg(f"❌ Mode {mode_raw} tidak dikenal. Pilih 1-7")
                         continue
-
                     save_mode(mode_raw)
                     tg(f"✅ Mode diubah ke <b>{mode_raw}</b> — akan aktif di cycle berikutnya")
                     log(f"Mode changed to {mode_raw} via Telegram", "📱 ")
@@ -268,7 +256,6 @@ def tg(msg: str):
 # ══════════════════════════════════════════════
 
 def get_wallet_age(addr: str) -> tuple[float, str]:
-    """Return (age_seconds, label)"""
     sigs = rpc("getSignaturesForAddress", [addr, {"limit": 1}]) or []
     if not sigs:
         return 999_999, "Unknown"
@@ -285,7 +272,6 @@ def get_wallet_age(addr: str) -> tuple[float, str]:
     return age, f"{h/24:.0f} hari"
 
 def get_funding_source(addr: str) -> dict:
-    """Cek dari mana wallet ini dapat SOL pertama kali"""
     sigs = rpc("getSignaturesForAddress", [addr, {"limit": 20}]) or []
     for s in sigs:
         tx = rpc("getTransaction", [s["signature"], {
@@ -293,25 +279,50 @@ def get_funding_source(addr: str) -> dict:
         }])
         if not tx:
             continue
-        keys  = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
-        pre   = tx.get("meta", {}).get("preBalances", []) or []
-        post  = tx.get("meta", {}).get("postBalances", []) or []
+        keys = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
+        pre  = tx.get("meta", {}).get("preBalances", []) or []
+        post = tx.get("meta", {}).get("postBalances", []) or []
         for i, k in enumerate(keys):
             a = k if isinstance(k, str) else k.get("pubkey", "")
             if not a or a == addr:
                 continue
             diff = (post[i] if i < len(post) else 0) - (pre[i] if i < len(pre) else 0)
-            if diff < -1_000_000:  # kirim SOL ke wallet ini
+            if diff < -1_000_000:
                 return {"funder": a, "amount": abs(diff) / 1e9}
     return {"funder": None, "amount": 0}
+
+def get_early_entry_rank(addr: str, token_mint: str) -> int | None:
+    """
+    FIX: Cek apakah wallet ini ada di early buyer token dengan cara yang bener.
+    Ambil TX dari mint account, lalu cek owner dari postTokenBalances.
+    Return rank (1-based) atau None kalau ga ketemu.
+    """
+    sigs = rpc("getSignaturesForAddress", [token_mint, {"limit": 30}]) or []
+    for rank, s in enumerate(reversed(sigs), 1):   # reversed = dari paling awal
+        tx = rpc("getTransaction", [s["signature"], {
+            "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0
+        }])
+        if not tx:
+            continue
+        pre_tok  = tx.get("meta", {}).get("preTokenBalances",  []) or []
+        post_tok = tx.get("meta", {}).get("postTokenBalances", []) or []
+        for p in post_tok:
+            if p.get("mint") != token_mint:
+                continue
+            owner = p.get("owner", "")
+            amt   = float(p.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
+            had   = any(x.get("mint") == token_mint and x.get("owner") == owner for x in pre_tok)
+            if owner == addr and amt > 0 and not had:
+                return rank
+    return None
 
 def score_wallet(addr: str, token_mint: str) -> dict:
     """
     Skor wallet 0–100 berdasarkan heuristics bandar:
-    - Wallet age
-    - Funding source
-    - Early entry
-    - Cluster behavior
+    - Wallet age     (max 35)
+    - Funding source (max 30)
+    - Early entry    (max 25) — FIX: pakai get_early_entry_rank yg bener
+    - Cluster        (max 10)
     """
     score   = 0
     reasons = []
@@ -321,7 +332,7 @@ def score_wallet(addr: str, token_mint: str) -> dict:
     if age_sec < 3_600:    score += 35; reasons.append(f"Wallet baru banget {age_lbl}")
     elif age_sec < 21_600: score += 25; reasons.append(f"Wallet {age_lbl}")
     elif age_sec < 86_400: score += 15; reasons.append(f"Wallet {age_lbl}")
-    else: reasons.append(f"Wallet lama ({age_lbl})")
+    else:                              reasons.append(f"Wallet lama ({age_lbl})")
 
     # ── 2. Funding source (max 30) ──
     funding = get_funding_source(addr)
@@ -335,28 +346,20 @@ def score_wallet(addr: str, token_mint: str) -> dict:
     else:
         reasons.append("Funding source tidak jelas")
 
-    # ── 3. Early entry — first buyer bonus (max 25) ──
-    token_sigs = rpc("getSignaturesForAddress", [token_mint, {"limit": 30}]) or []
-    wallet_sigs = rpc("getSignaturesForAddress", [addr, {"limit": 50}]) or []
-    token_sig_set = {s["signature"] for s in token_sigs}
-    wallet_sig_set = {s["signature"] for s in wallet_sigs}
-    overlap = token_sig_set & wallet_sig_set
-
-    if overlap:
-        # Cari rank entry
-        for rank, s in enumerate(token_sigs, 1):
-            if s["signature"] in overlap:
-                if rank == 1:   score += 25; reasons.append("🎯 TX PERTAMA di token ini!")
-                elif rank <= 3: score += 20; reasons.append(f"Early buyer rank #{rank}")
-                elif rank <= 10: score += 10; reasons.append(f"Early buyer rank #{rank}")
-                break
+    # ── 3. Early entry (max 25) — FIX ──
+    rank = get_early_entry_rank(addr, token_mint)
+    if rank is not None:
+        if rank == 1:    score += 25; reasons.append("🎯 TX PERTAMA di token ini!")
+        elif rank <= 3:  score += 20; reasons.append(f"Early buyer rank #{rank}")
+        elif rank <= 10: score += 10; reasons.append(f"Early buyer rank #{rank}")
+        else:                         reasons.append(f"Entry rank #{rank}")
     else:
         reasons.append("Bukan early buyer")
 
     # ── 4. Cluster check (max 10) ──
-    # Cek wallet lain yang sering interaksi dengan wallet ini di token yang sama
+    wallet_sigs = rpc("getSignaturesForAddress", [addr, {"limit": 15}]) or []
     co_wallets = {}
-    for s in (wallet_sigs or [])[:15]:
+    for s in wallet_sigs:
         tx = rpc("getTransaction", [s["signature"], {
             "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0
         }])
@@ -392,20 +395,20 @@ def get_token_info(mint: str) -> dict:
         )
         pair = r.json().get("pairs", [{}])[0]
         info = {
-            "name":   pair.get("baseToken", {}).get("name", mint[:8] + "..."),
-            "symbol": pair.get("baseToken", {}).get("symbol", "???"),
-            "price":  pair.get("priceUsd", "?"),
-            "liq":    float(pair.get("liquidity", {}).get("usd", 0) or 0),
+            "name":    pair.get("baseToken", {}).get("name", mint[:8] + "..."),
+            "symbol":  pair.get("baseToken", {}).get("symbol", "???"),
+            "price":   pair.get("priceUsd", "?"),
+            "liq":     float(pair.get("liquidity", {}).get("usd", 0) or 0),
+            "change":  float(pair.get("priceChange", {}).get("h24", 0) or 0),
             "dex_url": pair.get("url", f"https://dexscreener.com/solana/{mint}"),
         }
     except:
         info = {"name": mint[:8]+"...", "symbol": "???", "price": "?", "liq": 0,
-                "dex_url": f"https://dexscreener.com/solana/{mint}"}
+                "change": 0, "dex_url": f"https://dexscreener.com/solana/{mint}"}
     token_cache[mint] = info
     return info
 
 def fetch_new_tokens() -> list[dict]:
-    """Ambil token baru dari DexScreener"""
     try:
         r = requests.get(
             "https://api.dexscreener.com/token-profiles/latest/v1",
@@ -425,7 +428,7 @@ def fetch_new_tokens() -> list[dict]:
         return []
 
 # ══════════════════════════════════════════════
-# AUTO-SCAN MODE — Deteksi bandar dari token baru
+# AUTO-SCAN MODE
 # ══════════════════════════════════════════════
 
 def get_first_buyer(mint: str):
@@ -433,43 +436,35 @@ def get_first_buyer(mint: str):
     sigs = rpc("getSignaturesForAddress", [mint, {"limit": 10}]) or []
     if not sigs:
         return None
+    sol_spent = 0
     for s in reversed(sigs):
         tx = rpc("getTransaction", [s["signature"], {
             "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0
         }])
         if not tx:
             continue
-        pre_bal = tx.get("meta", {}).get("preBalances", [0]) or [0]
+        pre_bal  = tx.get("meta", {}).get("preBalances",  [0]) or [0]
         post_bal = tx.get("meta", {}).get("postBalances", [0]) or [0]
         sol_spent = max(0, (pre_bal[0] - post_bal[0]) / 1e9)
 
-        meta = tx.get("meta") or {}
-        pre  = meta.get("preTokenBalances")  or []
-        post = meta.get("postTokenBalances") or []
-        for p in post:
+        pre_tok  = tx.get("meta", {}).get("preTokenBalances",  []) or []
+        post_tok = tx.get("meta", {}).get("postTokenBalances", []) or []
+        for p in post_tok:
             if p.get("mint") != mint: continue
-            amt = float(p.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
-            if amt <= 0: continue
+            amt   = float(p.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
             owner = p.get("owner", "")
-            had = any(x.get("mint") == mint and x.get("owner") == owner for x in pre)
-            if not had and owner:
+            had   = any(x.get("mint") == mint and x.get("owner") == owner for x in pre_tok)
+            if not had and owner and amt > 0:
                 return owner, s["signature"], sol_spent
-    keys = (tx or {}).get("transaction", {}).get("message", {}).get("accountKeys", [])
-    for k in keys:
-        a = k if isinstance(k, str) else k.get("pubkey", "")
-        if a and a != mint:
-            return a, sigs[-1]["signature"], sol_spent
     return None
 
 def process_token(token: dict):
-    mint   = token["mint"]
-    sym    = token.get("symbol", "???")
+    mint = token["mint"]
+    sym  = token.get("symbol", "???")
 
-    # Skip mint bukan token biasa
     if mint in SKIP_MINTS:
         return
 
-    # Cek liquidity dulu
     info = get_token_info(mint)
     if info["liq"] < MIN_LIQUIDITY:
         return
@@ -493,11 +488,10 @@ def process_token(token: dict):
 
     if score >= ALERT_SCORE:
         r_str = "\n".join(f"▸ {r}" for r in reasons[:4])
-        bandar_sol = sol_spent
-        if bandar_sol >= 50:     tier = "🐳 MEGA WHALE"
-        elif bandar_sol >= 10:   tier = "🐋 WHALE"
-        elif bandar_sol >= 1:    tier = "🐟 MINI WHALE"
-        else:                    tier = "🎯 BANDAR"
+        if sol_spent >= 50:   tier = "🐳 MEGA WHALE"
+        elif sol_spent >= 10: tier = "🐋 WHALE"
+        elif sol_spent >= 1:  tier = "🐟 MINI WHALE"
+        else:                 tier = "🎯 BANDAR"
 
         msg = (
             f"{tier}\n"
@@ -506,16 +500,17 @@ def process_token(token: dict):
             f"<b>CA</b>: <code>{esc(mint)}</code>\n"
             f"<b>Liquidity</b>: ${info['liq']:,.0f}\n"
             f"<b>Price</b>: ${esc(info['price'])}\n"
-            f"<b>Bandar spend</b>: {bandar_sol:.2f} SOL (${bandar_sol*_sol_price:,.0f})\n\n"
+            f"<b>Bandar spend</b>: {sol_spent:.2f} SOL (${sol_spent*_sol_price:,.0f})\n\n"
             f"<b>Wallet</b>: <code>{esc(buyer)}</code>\n"
             f"<b>Age</b>: {esc(analysis['age_lbl'])}\n"
             f"<b>Score</b>: {score}/100 | {esc(conf)}\n\n"
             f"{esc(r_str)}\n\n"
             f"<a href='https://solscan.io/tx/{esc(sig)}'>TX</a> | "
             f"<a href='{esc(info['dex_url'])}'>DexScreener</a> | "
-            f"<a href='https://solscan.io/account/{esc(buyer)}'>Wallet</a>"
+            f"<a href='https://solscan.io/account/{esc(buyer)}'>Wallet</a> | "
+            f"<a href='https://gmgn.ai/sol/address/{esc(buyer)}'>GMGN</a>"
         )
-        log(f"  → Alert sent! Score {score}/100 | {bandar_sol:.2f}SOL", "✅ ")
+        log(f"  → Alert sent! Score {score}/100 | {sol_spent:.2f}SOL", "✅ ")
         tg(msg)
 
 def auto_scan_once():
@@ -547,9 +542,7 @@ def auto_scan_loop():
 PUMPFUN_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 def _handle_ws_token(sig, mint, owner, sol_spent=0):
-    if mint in seen_mints:
-        return
-    if mint in SKIP_MINTS:
+    if mint in seen_mints or mint in SKIP_MINTS:
         return
     seen_mints.add(mint)
 
@@ -561,26 +554,23 @@ def _handle_ws_token(sig, mint, owner, sol_spent=0):
     time.sleep(2)
     info = get_token_info(mint)
 
-    # Skip kalau belum migrasi ke DEX (liquidity < MIN_LIQUIDITY)
     if info["liq"] < MIN_LIQUIDITY:
         log(f"⏭️ Skip {mint[:8]}... belum migrasi (liq=${info['liq']:.0f})", "⏭️ ")
         return
 
     analysis = score_wallet(owner, mint)
-    score = analysis["score"]
-    conf = analysis["conf"]
-    reasons = analysis["reasons"]
+    score    = analysis["score"]
+    conf     = analysis["conf"]
+    reasons  = analysis["reasons"]
     log(f"  {owner[:8]}... score={score}/100 {conf}", "⚡ ")
 
     if score >= ALERT_SCORE:
-        r_str = "\n".join(f"▸ {esc(r)}" for r in reasons[:4])
+        r_str   = "\n".join(f"▸ {esc(r)}" for r in reasons[:4])
         liq_str = f"Liquidity: ${info['liq']:,.0f}" if info['liq'] > 0 else "🚀 Bonding curve"
-
-        bsol = sol_spent
-        if bsol >= 50:     tier = "🐳 MEGA WHALE"
-        elif bsol >= 10:   tier = "🐋 WHALE"
-        elif bsol >= 1:    tier = "🐟 MINI WHALE"
-        else:              tier = "🎯 BANDAR"
+        if sol_spent >= 50:   tier = "🐳 MEGA WHALE"
+        elif sol_spent >= 10: tier = "🐋 WHALE"
+        elif sol_spent >= 1:  tier = "🐟 MINI WHALE"
+        else:                 tier = "🎯 BANDAR"
 
         msg = (
             f"{tier} ⚡\n"
@@ -589,14 +579,15 @@ def _handle_ws_token(sig, mint, owner, sol_spent=0):
             f"<b>CA</b>: <code>{esc(mint)}</code>\n"
             f"{liq_str}\n"
             f"<b>Price</b>: ${esc(info['price'])}\n"
-            f"<b>Bandar spend</b>: {bsol:.2f} SOL (${bsol*_sol_price:,.0f})\n\n"
+            f"<b>Bandar spend</b>: {sol_spent:.2f} SOL (${sol_spent*_sol_price:,.0f})\n\n"
             f"<b>Wallet</b>: <code>{esc(owner)}</code>\n"
             f"<b>Age</b>: {esc(analysis['age_lbl'])}\n"
             f"<b>Score</b>: {score}/100 | {esc(conf)}\n\n"
             f"{r_str}\n\n"
             f"<a href='https://solscan.io/tx/{esc(sig)}'>TX</a> | "
             f"<a href='{esc(info['dex_url'])}'>DexScreener</a> | "
-            f"<a href='https://solscan.io/account/{esc(owner)}'>Wallet</a>"
+            f"<a href='https://solscan.io/account/{esc(owner)}'>Wallet</a> | "
+            f"<a href='https://gmgn.ai/sol/address/{esc(owner)}'>GMGN</a>"
         )
         tg(msg)
 
@@ -613,8 +604,8 @@ def ws_scan_loop():
             data = json.loads(raw)
             if "params" not in data:
                 return
-            val = data["params"]["result"]["value"]
-            sig = val["signature"]
+            val  = data["params"]["result"]["value"]
+            sig  = val["signature"]
             logs = val.get("logs", [])
             if val.get("err") or sig in seen_sigs:
                 return
@@ -629,20 +620,18 @@ def ws_scan_loop():
             if not tx:
                 return
 
-            pre_bal = tx.get("meta", {}).get("preBalances", [0]) or [0]
+            pre_bal  = tx.get("meta", {}).get("preBalances",  [0]) or [0]
             post_bal = tx.get("meta", {}).get("postBalances", [0]) or [0]
             sol_spent = max(0, (pre_bal[0] - post_bal[0]) / 1e9)
 
-            pre_tok = tx.get("meta", {}).get("preTokenBalances", []) or []
+            pre_tok  = tx.get("meta", {}).get("preTokenBalances",  []) or []
             post_tok = tx.get("meta", {}).get("postTokenBalances", []) or []
 
             for p in post_tok:
-                mint = p.get("mint", "")
+                mint  = p.get("mint", "")
                 owner = p.get("owner", "")
-                amt = float(p.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
-                if not mint or len(mint) < 32 or amt <= 0:
-                    continue
-                if mint in SKIP_MINTS:
+                amt   = float(p.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
+                if not mint or len(mint) < 32 or amt <= 0 or mint in SKIP_MINTS:
                     continue
                 had = any(x.get("mint") == mint and x.get("owner") == owner for x in pre_tok)
                 if had:
@@ -672,7 +661,7 @@ def ws_scan_loop():
             time.sleep(5)
 
 # ══════════════════════════════════════════════
-# TRACK MODE — Monitor wallet spesifik
+# TRACK MODE
 # ══════════════════════════════════════════════
 
 def poll_wallet(addr: str, label: str):
@@ -686,28 +675,25 @@ def poll_wallet(addr: str, label: str):
             "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0
         }])
         if not tx: continue
-        meta = tx.get("meta") or {}
-        pre  = meta.get("preTokenBalances")  or []
-        post = meta.get("postTokenBalances") or []
+        meta     = tx.get("meta") or {}
+        pre_tok  = meta.get("preTokenBalances",  []) or []
+        post_tok = meta.get("postTokenBalances", []) or []
 
-        # Cari token yang dibeli
-        for p in post:
-            amt = float(p.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
-            if amt <= 0: continue
+        for p in post_tok:
+            amt   = float(p.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
             mint  = p.get("mint", "")
             owner = p.get("owner", "")
-            if owner != addr: continue
-            had = any(x.get("mint") == mint and x.get("owner") == addr for x in pre)
-            if had: continue  # bukan beli baru
+            if amt <= 0 or owner != addr: continue
+            had = any(x.get("mint") == mint and x.get("owner") == addr for x in pre_tok)
+            if had: continue
 
-            # Hitung SOL yang dipakai
-            pre_sol  = (meta.get("preBalances")  or [0])[0]
-            post_sol = (meta.get("postBalances") or [0])[0]
+            pre_sol   = (meta.get("preBalances",  [0]) or [0])[0]
+            post_sol  = (meta.get("postBalances", [0]) or [0])[0]
             sol_spent = (pre_sol - post_sol) / 1e9
             usd_val   = sol_spent * get_sol_price()
 
             info = get_token_info(mint)
-            log(f"{label} BUY ${info['symbol']} ({mint}) {sol_spent:.2f}SOL (~${usd_val:,.0f})", "🐋 ")
+            log(f"{label} BUY ${info['symbol']} {sol_spent:.2f}SOL (~${usd_val:,.0f})", "🐋 ")
 
             if usd_val >= MIN_BUY_USD:
                 msg = (
@@ -720,10 +706,11 @@ def poll_wallet(addr: str, label: str):
                     f"<b>Amount</b>: {sol_spent:.2f} SOL (~${usd_val:,.0f})\n"
                     f"<b>Price</b>: ${esc(info['price'])}\n\n"
                     f"<a href='https://solscan.io/tx/{esc(sig)}'>TX</a> | "
-                    f"<a href='{esc(info['dex_url'])}'>DexScreener</a>"
+                    f"<a href='{esc(info['dex_url'])}'>DexScreener</a> | "
+                    f"<a href='https://gmgn.ai/sol/address/{esc(addr)}'>GMGN</a>"
                 )
                 tg(msg)
-            break  # satu token per tx cukup
+            break
 
 def track_once():
     if not tracked_wallets:
@@ -756,66 +743,43 @@ def track_loop():
 # ══════════════════════════════════════════════
 
 def fetch_pumped_tokens(limit: int = 30) -> list[dict]:
-    """
-    Ambil token Solana yang sudah pump dari DexScreener:
-    - price change 24h tinggi
-    - liquidity cukup
-    """
     results = []
     try:
-        # Coba endpoint boosted (token yang lagi trending)
-        r = requests.get(
-            "https://api.dexscreener.com/token-boosts/top/v1",
-            timeout=8
-        )
-        boosts = r.json() or []
-        for t in boosts:
-            if t.get("chainId") != "solana":
-                continue
-            mint = t.get("tokenAddress", "")
-            if mint and mint not in SKIP_MINTS:
-                results.append({"mint": mint, "source": "boosted"})
+        r = requests.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=8)
+        for t in (r.json() or []):
+            if t.get("chainId") == "solana":
+                mint = t.get("tokenAddress", "")
+                if mint and mint not in SKIP_MINTS:
+                    results.append({"mint": mint, "source": "boosted"})
     except:
         pass
 
-    # Fallback: ambil dari token-profiles/latest
     if len(results) < 10:
         try:
-            r = requests.get(
-                "https://api.dexscreener.com/token-profiles/latest/v1",
-                timeout=8
-            )
-            tokens = r.json() or []
-            for t in tokens:
-                if t.get("chainId") != "solana":
-                    continue
-                mint = t.get("tokenAddress", "")
-                if mint and mint not in SKIP_MINTS:
-                    results.append({"mint": mint, "source": "latest"})
+            r = requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=8)
+            for t in (r.json() or []):
+                if t.get("chainId") == "solana":
+                    mint = t.get("tokenAddress", "")
+                    if mint and mint not in SKIP_MINTS:
+                        results.append({"mint": mint, "source": "latest"})
         except:
             pass
 
-    # Deduplicate
     seen = set()
-    out = []
+    out  = []
     for t in results:
         if t["mint"] not in seen:
             seen.add(t["mint"])
             out.append(t)
     return out[:limit]
 
-
 def get_early_buyers(mint: str, top_n: int = 5) -> list[tuple[str, float]]:
-    """
-    Return list of (wallet_addr, sol_spent) dari top-N early buyer token ini.
-    Ambil dari signature paling awal di akun mint.
-    """
     sigs = rpc("getSignaturesForAddress", [mint, {"limit": 20}]) or []
     if not sigs:
         return []
 
     buyers = []
-    for s in reversed(sigs):   # reversed = dari yang paling lama
+    for s in reversed(sigs):
         if len(buyers) >= top_n:
             break
         tx = rpc("getTransaction", [s["signature"], {
@@ -824,7 +788,7 @@ def get_early_buyers(mint: str, top_n: int = 5) -> list[tuple[str, float]]:
         if not tx:
             continue
 
-        pre_bal  = tx.get("meta", {}).get("preBalances", [0]) or [0]
+        pre_bal  = tx.get("meta", {}).get("preBalances",  [0]) or [0]
         post_bal = tx.get("meta", {}).get("postBalances", [0]) or [0]
         sol_spent = max(0, (pre_bal[0] - post_bal[0]) / 1e9)
 
@@ -832,41 +796,85 @@ def get_early_buyers(mint: str, top_n: int = 5) -> list[tuple[str, float]]:
         post_tok = tx.get("meta", {}).get("postTokenBalances", []) or []
 
         for p in post_tok:
-            if p.get("mint") != mint:
-                continue
+            if p.get("mint") != mint: continue
             amt   = float(p.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
             owner = p.get("owner", "")
-            if amt <= 0 or not owner:
-                continue
+            if amt <= 0 or not owner: continue
             had = any(x.get("mint") == mint and x.get("owner") == owner for x in pre_tok)
-            if had:
-                continue
+            if had: continue
             if sol_spent >= MIN_BANDAR_SOL:
                 buyers.append((owner, sol_spent))
             break
 
     return buyers
 
-
 def analyze_wallet_history(addr: str) -> dict:
     """
-    Cek performa historis wallet ini di token lain:
-    - Berapa kali dia early entry di token yang akhirnya pump?
-    - Hitung win_rate = pumped / total_checked
+    FIX: Kalau GMGN_API_KEY ada → pakai GMGN (1 call, akurat pakai realized PnL).
+    Fallback ke RPC kalau tidak ada key.
     """
-    # Ambil 50 tx terakhir wallet ini
+    if GMGN_API_KEY:
+        return _analyze_wallet_gmgn(addr)
+    return _analyze_wallet_rpc(addr)
+
+def _analyze_wallet_gmgn(addr: str) -> dict:
+    """Ambil win rate & PnL dari GMGN API — 1 HTTP call per wallet."""
+    try:
+        headers = {
+            "Authorization": f"Bearer {GMGN_API_KEY}",
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        }
+        r = requests.get(
+            f"https://gmgn.ai/api/v1/smartmoney/sol/walletNew/{addr}",
+            headers=headers,
+            params={"period": "7d"},
+            timeout=8,
+        )
+        if not r.ok:
+            log(f"GMGN API error {r.status_code} untuk {addr[:8]}, fallback ke RPC", "⚠️ ")
+            return _analyze_wallet_rpc(addr)
+
+        data            = r.json().get("data", {}) or {}
+        win_rate        = float(data.get("win_rate") or 0)
+        realized_profit = float(data.get("realized_profit") or 0)
+        total_trades    = int(data.get("buy_30d") or 0)
+        wins            = round(win_rate * total_trades)
+
+        token_results = []
+        for t in (data.get("token_list") or [])[:5]:
+            token_results.append({
+                "mint":   t.get("address", ""),
+                "symbol": t.get("symbol", "???"),
+                "liq":    float(t.get("liquidity") or 0),
+                "pumped": float(t.get("realized_profit") or 0) > 0,
+                "sol":    float(t.get("cost") or 0) / (_sol_price or 150),
+            })
+
+        return {
+            "win_rate":        win_rate,
+            "wins":            wins,
+            "total":           total_trades,
+            "realized_profit": realized_profit,
+            "tokens":          token_results,
+        }
+
+    except Exception as e:
+        log(f"GMGN error untuk {addr[:8]}: {e}, fallback ke RPC", "⚠️ ")
+        return _analyze_wallet_rpc(addr)
+
+def _analyze_wallet_rpc(addr: str) -> dict:
+    """Fallback: hitung dari raw RPC (boros tapi tetap jalan tanpa GMGN key)."""
     sigs = rpc("getSignaturesForAddress", [addr, {"limit": 50}]) or []
     if not sigs:
         return {"win_rate": 0, "wins": 0, "total": 0, "tokens": []}
 
-    mints_bought = {}   # mint -> sol_spent
-
+    mints_bought = {}
     for s in sigs:
         tx = rpc("getTransaction", [s["signature"], {
             "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0
         }])
-        if not tx:
-            continue
+        if not tx: continue
         pre_tok  = tx.get("meta", {}).get("preTokenBalances",  []) or []
         post_tok = tx.get("meta", {}).get("postTokenBalances", []) or []
         pre_bal  = tx.get("meta", {}).get("preBalances",  [0]) or [0]
@@ -877,8 +885,7 @@ def analyze_wallet_history(addr: str) -> dict:
             mint  = p.get("mint", "")
             owner = p.get("owner", "")
             amt   = float(p.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
-            if owner != addr or not mint or amt <= 0 or mint in SKIP_MINTS:
-                continue
+            if owner != addr or not mint or amt <= 0 or mint in SKIP_MINTS: continue
             had = any(x.get("mint") == mint and x.get("owner") == addr for x in pre_tok)
             if not had:
                 mints_bought[mint] = sol_spent
@@ -886,40 +893,25 @@ def analyze_wallet_history(addr: str) -> dict:
     if not mints_bought:
         return {"win_rate": 0, "wins": 0, "total": 0, "tokens": []}
 
-    # Check mana yang pumped
     wins = 0
     token_results = []
-    for mint, sol in list(mints_bought.items())[:15]:    # max 15 buat hemat RPC
-        info = get_token_info(mint)
-        liq  = info.get("liq", 0)
-        # Anggap "pumped" kalau liquidity cukup tinggi
-        pumped = liq >= PUMPED_MIN_LIQ
-        if pumped:
-            wins += 1
+    for mint, sol in list(mints_bought.items())[:15]:
+        info   = get_token_info(mint)
+        liq    = info.get("liq", 0)
+        # FIX: cek liq DAN price change supaya lebih akurat
+        change = info.get("change", 0)
+        pumped = liq >= PUMPED_MIN_LIQ and change > 0
+        if pumped: wins += 1
         token_results.append({
-            "mint":   mint,
-            "symbol": info.get("symbol", "???"),
-            "liq":    liq,
-            "pumped": pumped,
-            "sol":    sol,
+            "mint": mint, "symbol": info.get("symbol", "???"),
+            "liq": liq, "pumped": pumped, "sol": sol,
         })
 
-    total = len(token_results)
+    total    = len(token_results)
     win_rate = wins / total if total > 0 else 0
-
-    return {
-        "win_rate": win_rate,
-        "wins":     wins,
-        "total":    total,
-        "tokens":   token_results,
-    }
-
+    return {"win_rate": win_rate, "wins": wins, "total": total, "tokens": token_results}
 
 def discover_smart_wallets_from_token(token: dict) -> list[str]:
-    """
-    Dari satu token yang pumped, extract early buyer-nya,
-    analisis historis mereka, dan return wallet yang layak di-track.
-    """
     mint = token["mint"]
     info = get_token_info(mint)
     if info["liq"] < PUMPED_MIN_LIQ:
@@ -938,17 +930,18 @@ def discover_smart_wallets_from_token(token: dict) -> list[str]:
         if addr in tracked_wallets or addr in discovered_set:
             continue
         if len(tracked_wallets) >= DISCOVER_MAX_WALLETS:
-            log(f"Max wallet ({DISCOVER_MAX_WALLETS}) tercapai, skip discover", "⚠️ ")
+            log(f"Max wallet ({DISCOVER_MAX_WALLETS}) tercapai, skip", "⚠️ ")
             break
 
         log(f"   Analisis {addr[:10]}... (spent {sol_spent:.2f} SOL)", "🧠 ")
         tg(f"⏳ Analisis wallet {i}/{len(buyers)}: <code>{esc(addr[:10])}...</code> (spent {sol_spent:.2f} SOL)")
-        hist = analyze_wallet_history(addr)
-        wr   = hist["win_rate"]
-        wins = hist["wins"]
+        hist  = analyze_wallet_history(addr)
+        wr    = hist["win_rate"]
+        wins  = hist["wins"]
         total = hist["total"]
+        realized = hist.get("realized_profit", 0)
 
-        log(f"   → win_rate={wr:.0%} ({wins}/{total} tokens pumped)", "🧠 ")
+        log(f"   → win_rate={wr:.0%} ({wins}/{total})", "🧠 ")
 
         if total >= DISCOVER_MIN_TOKENS and wr >= DISCOVER_MIN_WINRATE:
             label = f"SmartMoney_{addr[:6]}"
@@ -957,20 +950,20 @@ def discover_smart_wallets_from_token(token: dict) -> list[str]:
             save_wallets()
             good_wallets.append(addr)
 
-            # Kirim notif Telegram
             top_wins = [t for t in hist["tokens"] if t["pumped"]][:3]
             win_str  = "\n".join(
-                f"  ✅ ${esc(t['symbol'])} — <code>{esc(t['mint'])}</code> — liq ${t['liq']:,.0f} (spent {t['sol']:.2f} SOL)"
+                f"  ✅ ${esc(t['symbol'])} — liq ${t['liq']:,.0f} (spent {t['sol']:.2f} SOL)"
                 for t in top_wins
             )
+            realized_str = f"\n<b>Realized PnL</b>: ${realized:,.0f}" if realized else ""
             msg = (
                 f"🧠 <b>SMART MONEY DISCOVERED</b>\n"
                 f"━━━━━━━━━━━━━━━━━\n\n"
                 f"<b>Wallet</b>: <code>{esc(addr)}</code>\n"
                 f"<b>Label</b>: {esc(label)}\n\n"
-                f"<b>Win Rate</b>: {wr:.0%} ({wins}/{total} tokens pumped)\n"
-                f"<b>Ditemukan dari</b>: ${esc(info['symbol'])} "
-                f"(liq ${info['liq']:,.0f})\n"
+                f"<b>Win Rate</b>: {wr:.0%} ({wins}/{total} tokens pumped)"
+                f"{realized_str}\n"
+                f"<b>Ditemukan dari</b>: ${esc(info['symbol'])} (liq ${info['liq']:,.0f})\n"
                 f"<b>SOL dipakai</b>: {sol_spent:.2f} SOL\n\n"
                 f"<b>Token yang pumped:</b>\n{win_str}\n\n"
                 f"<a href='https://solscan.io/account/{esc(addr)}'>Solscan</a> | "
@@ -981,7 +974,6 @@ def discover_smart_wallets_from_token(token: dict) -> list[str]:
             log(f"   ✅ Auto-added: {label} (win_rate={wr:.0%})", "🧠 ")
 
     return good_wallets
-
 
 def auto_discover_once():
     try:
@@ -996,28 +988,19 @@ def auto_discover_once():
             log(f"🔎 Token {i}/{len(pumped)}: {token['mint'][:8]}...", "🧠 ")
             found = discover_smart_wallets_from_token(token)
             new_wallets_total += len(found)
-        if new_wallets_total:
-            log(f"🧠 Siklus selesai — {new_wallets_total} wallet baru ditambahkan", "🧠 ")
-            tg(f"✅ <b>Discover selesai</b> — {new_wallets_total} wallet baru ditambahkan")
-        else:
-            log(f"🧠 Siklus selesai — tidak ada wallet baru", "🧠 ")
-            tg(f"✅ <b>Discover selesai</b> — tidak ada wallet baru")
+        msg = f"✅ <b>Discover selesai</b> — {new_wallets_total} wallet baru ditambahkan" if new_wallets_total else "✅ <b>Discover selesai</b> — tidak ada wallet baru"
+        log(f"🧠 Siklus selesai — {new_wallets_total} wallet baru", "🧠 ")
+        tg(msg)
     except Exception as e:
         log(f"Error di discover: {e}", "❌ ")
 
 def auto_discover_loop():
-    """
-    Loop utama auto-discover:
-    1. Ambil token yang pumped dari DexScreener
-    2. Extract early buyer-nya
-    3. Analisis historis wallet
-    4. Auto-add kalau win rate cukup tinggi
-    """
     log("🧠 Auto-Discover Smart Money aktif", "🧠 ")
     log(f"   Min win rate: {DISCOVER_MIN_WINRATE:.0%} | Min tokens: {DISCOVER_MIN_TOKENS}")
     log(f"   Max wallets tracked: {DISCOVER_MAX_WALLETS}")
+    mode_str = "GMGN API" if GMGN_API_KEY else "RPC fallback"
     tg(
-        f"🧠 <b>Auto-Discover aktif</b>\n"
+        f"🧠 <b>Auto-Discover aktif</b> [{mode_str}]\n"
         f"Min win rate: {DISCOVER_MIN_WINRATE:.0%} | "
         f"Min tokens: {DISCOVER_MIN_TOKENS} | "
         f"Max wallet: {DISCOVER_MAX_WALLETS}"
@@ -1026,15 +1009,16 @@ def auto_discover_loop():
         auto_discover_once()
         time.sleep(DISCOVER_INTERVAL)
 
-
 # ══════════════════════════════════════════════
 # INTERACTIVE MENU
 # ══════════════════════════════════════════════
 
 def print_banner():
-    print("""
+    mode_str = "✅ GMGN API" if GMGN_API_KEY else "⚠️  RPC fallback"
+    print(f"""
 ╔══════════════════════════════════════════════╗
 ║        🐋 SOLANA BANDAR TRACKER v3          ║
+║   Wallet analysis: {mode_str:<24}║
 ╚══════════════════════════════════════════════╝""")
 
 def interactive_menu():
@@ -1138,11 +1122,10 @@ Mode:
             print("Pilihan tidak dikenal")
 
 # ══════════════════════════════════════════════
-# CI / SINGLE-RUN (untuk GitHub Actions & cron)
+# CI / SINGLE-RUN (untuk GitHub Actions)
 # ══════════════════════════════════════════════
 
 def ci_run(mode: str):
-    """Single pass — jalan satu siklus, simpan state, exit"""
     log(f"CI mode — mode={mode}", "🤖 ")
     if mode == "2":
         for addr in tracked_wallets:
@@ -1153,34 +1136,32 @@ def ci_run(mode: str):
     elif mode == "6":
         auto_discover_once()
     elif mode == "7":
+        # FIX: discover dulu, track setelahnya (bukan seed dulu)
+        auto_discover_once()
         for addr in tracked_wallets:
             sigs = rpc("getSignaturesForAddress", [addr, {"limit": 10}]) or []
             for s in sigs: seen_sigs.add(s["signature"])
-        log(f"Seeded {len(seen_sigs)} existing signatures")
-        auto_discover_once()
         track_once()
     else:
         auto_scan_once()
     save_seen()
 
-
 def run_loop(mode: str):
-    """Continuous loop — jalan terus dengan interval, auto-stop setelah 5.5 jam"""
-    start_time = time.time()
-    max_duration = 19800
-    cycle_count = 0
+    start_time   = time.time()
+    max_duration = 19800  # 5.5 jam
+    cycle_count  = 0
     current_mode = mode
 
     listen_tg_commands()
     save_mode(mode)
 
-    log(f"🔄 Continuous loop started — interval={SCAN_INTERVAL}s, max_duration={max_duration}s ({max_duration//3600}j)")
+    log(f"🔄 Continuous loop started — interval={SCAN_INTERVAL}s, max={max_duration//3600}j")
     tg(f"🔄 <b>Bandar Tracker Continuous</b> — Mode {mode}, interval {SCAN_INTERVAL}s, max {max_duration//3600}j")
 
     while True:
         elapsed = time.time() - start_time
         if elapsed >= max_duration:
-            log(f"⏰ Timeout {max_duration}s tercapai ({elapsed:.0f}s), {cycle_count} cycle")
+            log(f"⏰ Timeout tercapai ({elapsed:.0f}s), {cycle_count} cycle")
             tg(f"⏰ <b>Bandar Tracker selesai</b> — {cycle_count} cycle dalam {elapsed/3600:.1f} jam")
             break
 
@@ -1191,8 +1172,8 @@ def run_loop(mode: str):
             tg(f"📱 <b>Mode diubah ke {current_mode}</b> — mulai cycle berikutnya")
 
         cycle_count += 1
+        cycle_start  = time.time()
         log(f"🔄 Cycle #{cycle_count} ({elapsed/3600:.2f}h elapsed)")
-        cycle_start = time.time()
         tg(f"🔄 <b>Cycle #{cycle_count}</b> — {elapsed/3600:.1f}h elapsed, mode {current_mode}...")
 
         if current_mode == "2":
@@ -1203,27 +1184,24 @@ def run_loop(mode: str):
         elif current_mode == "6":
             auto_discover_once()
         elif current_mode == "7":
+            auto_discover_once()
             for addr in tracked_wallets:
                 sigs = rpc("getSignaturesForAddress", [addr, {"limit": 10}]) or []
                 for s in sigs: seen_sigs.add(s["signature"])
-            auto_discover_once()
             track_once()
         else:
             auto_scan_once()
 
         save_seen()
-
         cycle_duration = time.time() - cycle_start
         tg(f"✅ <b>Cycle #{cycle_count}</b> selesai dalam {cycle_duration/60:.1f} menit")
 
         if time.time() - start_time >= max_duration:
             break
-
         time.sleep(SCAN_INTERVAL)
 
     save_seen()
     sys.exit(0)
-
 
 # ══════════════════════════════════════════════
 # ENTRY POINT
@@ -1235,8 +1213,8 @@ if __name__ == "__main__":
     get_sol_price()
 
     ci_mode = "--ci" in sys.argv
-    ci_env = os.environ.get("CI", "").lower()
-    mode = None
+    ci_env  = os.environ.get("CI", "").lower()
+    mode    = None
     if "--mode" in sys.argv:
         idx = sys.argv.index("--mode")
         if idx + 1 < len(sys.argv):
@@ -1256,7 +1234,6 @@ if __name__ == "__main__":
             save_seen()
             sys.exit(0)
 
-    # CLI: python bandar_tracker.py <wallet1> <wallet2> ...
     cli_wallets = [a for a in sys.argv[1:] if len(a) >= 32 and not a.startswith("--")]
     if cli_wallets:
         for addr in cli_wallets:
