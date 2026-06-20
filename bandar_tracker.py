@@ -1026,34 +1026,34 @@ def discover_smart_wallets_from_token(token: dict) -> list[str]:
             log(f"   ⚠️ Gagal cek holdings, tetap diproses", "⚠️ ")
 
         label = f"SmartMoney_{addr[:6]}"
-            tracked_wallets[addr] = label
-            discovered_set.add(addr)
-            save_wallets()
-            good_wallets.append(addr)
+        tracked_wallets[addr] = label
+        discovered_set.add(addr)
+        save_wallets()
+        good_wallets.append(addr)
 
-            top_wins = [t for t in hist["tokens"] if t["pumped"]][:3]
-            win_str  = "\n".join(
-                f"  ✅ ${esc(t['symbol'])} — liq ${t['liq']:,.0f} (spent {t['sol']:.2f} SOL)"
-                for t in top_wins
-            )
-            realized_str = f"\n<b>Realized PnL</b>: ${realized:,.0f}" if realized else ""
-            msg = (
-                f"🧠 <b>HOLDER DISCOVERED</b>\n"
-                f"━━━━━━━━━━━━━━━━━\n\n"
-                f"<b>Wallet</b>: <code>{esc(addr)}</code>\n"
-                f"<b>Label</b>: {esc(label)}\n\n"
-                f"<b>Win Rate</b>: {wr:.0%} ({wins}/{total} tokens pumped)"
-                f"{realized_str}\n"
-                f"<b>Holder Score</b>: {holder_score:.0%}\n"
-                f"<b>Ditemukan dari</b>: ${esc(info['symbol'])} (liq ${info['liq']:,.0f})\n"
-                f"<b>SOL dipakai</b>: {sol_spent:.2f} SOL\n\n"
-                f"<b>Token yang pumped:</b>\n{win_str}\n\n"
-                f"<a href='https://solscan.io/account/{esc(addr)}'>Solscan</a> | "
-                f"<a href='https://gmgn.ai/sol/address/{esc(addr)}'>GMGN</a>\n\n"
-                f"✅ <i>Wallet otomatis di-track!</i>"
-            )
-            tg(msg)
-            log(f"   ✅ Auto-added: {label} (win_rate={wr:.0%})", "🧠 ")
+        top_wins = [t for t in hist["tokens"] if t["pumped"]][:3]
+        win_str  = "\n".join(
+            f"  ✅ ${esc(t['symbol'])} — liq ${t['liq']:,.0f} (spent {t['sol']:.2f} SOL)"
+            for t in top_wins
+        )
+        realized_str = f"\n<b>Realized PnL</b>: ${realized:,.0f}" if realized else ""
+        msg = (
+            f"🧠 <b>HOLDER DISCOVERED</b>\n"
+            f"━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>Wallet</b>: <code>{esc(addr)}</code>\n"
+            f"<b>Label</b>: {esc(label)}\n\n"
+            f"<b>Win Rate</b>: {wr:.0%} ({wins}/{total} tokens pumped)"
+            f"{realized_str}\n"
+            f"<b>Holder Score</b>: {holder_score:.0%}\n"
+            f"<b>Ditemukan dari</b>: ${esc(info['symbol'])} (liq ${info['liq']:,.0f})\n"
+            f"<b>SOL dipakai</b>: {sol_spent:.2f} SOL\n\n"
+            f"<b>Token yang pumped:</b>\n{win_str}\n\n"
+            f"<a href='https://solscan.io/account/{esc(addr)}'>Solscan</a> | "
+            f"<a href='https://gmgn.ai/sol/address/{esc(addr)}'>GMGN</a>\n\n"
+            f"✅ <i>Wallet otomatis di-track!</i>"
+        )
+        tg(msg)
+        log(f"   ✅ Auto-added: {label} (win_rate={wr:.0%})", "🧠 ")
 
     return good_wallets
 
