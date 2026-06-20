@@ -1083,6 +1083,53 @@ def ci_run(mode: str):
         auto_scan_once()
     save_seen()
 
+
+def run_loop(mode: str):
+    """Continuous loop — jalan terus dengan interval, auto-stop setelah 5.5 jam"""
+    start_time = time.time()
+    max_duration = 19800
+    cycle_count = 0
+
+    log(f"🔄 Continuous loop started — interval={SCAN_INTERVAL}s, max_duration={max_duration}s ({max_duration//3600}j)")
+    tg(f"🔄 <b>Bandar Tracker Continuous</b> — Mode {mode}, interval {SCAN_INTERVAL}s, max {max_duration//3600}j")
+
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed >= max_duration:
+            log(f"⏰ Timeout {max_duration}s tercapai ({elapsed:.0f}s), {cycle_count} cycle")
+            tg(f"⏰ <b>Bandar Tracker selesai</b> — {cycle_count} cycle dalam {elapsed/3600:.1f} jam")
+            break
+
+        cycle_count += 1
+        log(f"🔄 Cycle #{cycle_count} ({elapsed/3600:.2f}h elapsed)")
+
+        if mode == "2":
+            for addr in tracked_wallets:
+                sigs = rpc("getSignaturesForAddress", [addr, {"limit": 10}]) or []
+                for s in sigs: seen_sigs.add(s["signature"])
+            track_once()
+        elif mode == "6":
+            auto_discover_once()
+        elif mode == "7":
+            for addr in tracked_wallets:
+                sigs = rpc("getSignaturesForAddress", [addr, {"limit": 10}]) or []
+                for s in sigs: seen_sigs.add(s["signature"])
+            auto_discover_once()
+            track_once()
+        else:
+            auto_scan_once()
+
+        save_seen()
+
+        if time.time() - start_time >= max_duration:
+            break
+
+        time.sleep(SCAN_INTERVAL)
+
+    save_seen()
+    sys.exit(0)
+
+
 # ══════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════
@@ -1093,6 +1140,7 @@ if __name__ == "__main__":
     get_sol_price()
 
     ci_mode = "--ci" in sys.argv
+    ci_env = os.environ.get("CI", "").lower()
     mode = None
     if "--mode" in sys.argv:
         idx = sys.argv.index("--mode")
@@ -1100,15 +1148,18 @@ if __name__ == "__main__":
             mode = sys.argv[idx + 1]
 
     if ci_mode and mode:
-        tg(f"🤖 <b>Bandar Tracker CI</b> — Mode {mode}")
-        try:
-            ci_run(mode)
-        except KeyboardInterrupt:
-            pass
-        except Exception as e:
-            log(f"CI error: {e}", "❌ ")
-        save_seen()
-        sys.exit(0)
+        if ci_env == "false":
+            run_loop(mode)
+        else:
+            tg(f"🤖 <b>Bandar Tracker CI</b> — Mode {mode}")
+            try:
+                ci_run(mode)
+            except KeyboardInterrupt:
+                pass
+            except Exception as e:
+                log(f"CI error: {e}", "❌ ")
+            save_seen()
+            sys.exit(0)
 
     # CLI: python bandar_tracker.py <wallet1> <wallet2> ...
     cli_wallets = [a for a in sys.argv[1:] if len(a) >= 32 and not a.startswith("--")]
