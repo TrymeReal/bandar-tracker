@@ -1,0 +1,43 @@
+name: Bandar Tracker
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: bandar-tracker
+  cancel-in-progress: false
+
+jobs:
+  tracker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests websocket-client
+
+      - name: Restore cache
+        id: cache-data
+        uses: actions/cache@v4
+        with:
+          path: |
+            seen_sigs.json
+            seen_mints.json
+            wallets.json
+          key: bandar-tracker-${{ github.run_id }}
+          restore-keys: bandar-tracker-
+
+      - name: Run tracker
+        run: python bandar_tracker.py --ci --mode 7
+        env:
+          CI: 'true'
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_THREAD: ${{ secrets.TG_THREAD }}
+          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
