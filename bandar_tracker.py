@@ -1058,6 +1058,12 @@ async def ci_run(mode: str, client: httpx.AsyncClient):
 
     save_seen()
     save_wallets()
+
+    # Tunggu semua pesan Telegram terkirim sebelum exit
+    if _msg_queue is not None:
+        log("Menunggu Telegram queue kosong...")
+        await _msg_queue.join()
+
     log("CI siklus selesai ✅")
 
 
