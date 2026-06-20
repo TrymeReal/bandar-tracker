@@ -1007,18 +1007,25 @@ def discover_smart_wallets_from_token(token: dict) -> list[str]:
         total = hist["total"]
         realized = hist.get("realized_profit", 0)
 
+        log(f"   → win_rate={wr:.0%} ({wins}/{total})", "🧠 ")
+
+        if not (total >= DISCOVER_MIN_TOKENS and wr >= DISCOVER_MIN_WINRATE):
+            log(f"   ⏭️ Skip (win rate terlalu rendah)", "⏭️ ")
+            continue
+
         # Cek holder score — skip flipper (buy then sell cepet)
         bought = [t.get("mint") for t in hist.get("tokens", []) if t.get("mint")]
         current_mints = get_current_holdings(addr)
         holder_score = calculate_holder_score(bought, current_mints) if bought else 0
-        log(f"   → win_rate={wr:.0%} ({wins}/{total}) holder_score={holder_score:.0%}", "🧠 ")
+        log(f"   → holder_score={holder_score:.0%} (holding {len(current_mints)} token)", "🧠 ")
 
-        if holder_score < DISCOVER_MIN_HOLDER:
+        if current_mints and holder_score < DISCOVER_MIN_HOLDER:
             log(f"   ⏭️ Skip flipper (holder_score={holder_score:.0%})", "⏭️ ")
             continue
+        if not current_mints:
+            log(f"   ⚠️ Gagal cek holdings, tetap diproses", "⚠️ ")
 
-        if total >= DISCOVER_MIN_TOKENS and wr >= DISCOVER_MIN_WINRATE:
-            label = f"SmartMoney_{addr[:6]}"
+        label = f"SmartMoney_{addr[:6]}"
             tracked_wallets[addr] = label
             discovered_set.add(addr)
             save_wallets()
@@ -1213,6 +1220,7 @@ def run_loop(mode: str):
     listen_tg_commands()
     save_mode(mode)
 
+    tg(f"🤖 <b>Tracker aktif</b> — Mode {mode}, max {max_duration//3600}j")
     log(f"🔄 Continuous loop started — interval={SCAN_INTERVAL}s, max={max_duration//3600}j")
     while True:
         elapsed = time.time() - start_time
