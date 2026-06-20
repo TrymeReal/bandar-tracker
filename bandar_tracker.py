@@ -83,6 +83,7 @@ _sol_price       = 150.0
 DATA_FILE        = os.path.join(os.path.dirname(__file__), "wallets.json")
 SEEN_SIGS_FILE   = os.path.join(os.path.dirname(__file__), "seen_sigs.json")
 SEEN_MINTS_FILE  = os.path.join(os.path.dirname(__file__), "seen_mints.json")
+MODE_FILE        = os.path.join(os.path.dirname(__file__), "mode.json")
 
 # State untuk auto-discover
 wallet_history   = {}   # { wallet_addr: [{"mint":..., "score":..., "pumped":bool}, ...] }
@@ -169,6 +170,74 @@ def load_seen():
             log(f"Loaded {len(seen_mints)} seen mints")
         except:
             pass
+
+def save_mode(mode: str):
+    try:
+        with open(MODE_FILE, "w") as f:
+            json.dump({"mode": mode}, f)
+    except:
+        pass
+
+def load_mode() -> str | None:
+    try:
+        if os.path.exists(MODE_FILE):
+            with open(MODE_FILE) as f:
+                return json.load(f).get("mode")
+    except:
+        pass
+    return None
+
+_last_update_id = 0
+_tg_listener_started = False
+
+def listen_tg_commands():
+    global _last_update_id, _tg_listener_started
+    if _tg_listener_started:
+        return
+    _tg_listener_started = True
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+
+    def poll():
+        global _last_update_id
+        while True:
+            try:
+                params = {"offset": _last_update_id + 1, "timeout": 10, "allowed_updates": ["message"]}
+                r = requests.get(url, params=params, timeout=15)
+                if not r.ok:
+                    continue
+                for upd in r.json().get("result", []):
+                    _last_update_id = upd["update_id"]
+                    msg = upd.get("message", {})
+                    chat_id = msg.get("chat", {}).get("id")
+                    thread_id = msg.get("message_thread_id")
+                    text = (msg.get("text") or "").strip()
+
+                    if chat_id != int(TELEGRAM_CHAT_ID):
+                        continue
+                    if TELEGRAM_THREAD and thread_id != TELEGRAM_THREAD:
+                        continue
+                    if not text.startswith("/mode"):
+                        continue
+
+                    parts = text.split()
+                    if len(parts) != 2 or not parts[1].isdigit():
+                        tg("❌ Format: <code>/mode &lt;angka&gt;</code> — contoh: <code>/mode 6</code>")
+                        continue
+
+                    new_mode = parts[1]
+                    if new_mode not in ("1", "2", "3", "4", "5", "6", "7"):
+                        tg(f"❌ Mode {new_mode} tidak dikenal. Pilih 1-7")
+                        continue
+
+                    save_mode(new_mode)
+                    tg(f"✅ Mode diubah ke <b>{new_mode}</b> — akan aktif di cycle berikutnya")
+                    log(f"Mode changed to {new_mode} via Telegram", "📱 ")
+            except:
+                pass
+            time.sleep(3)
+
+    t = threading.Thread(target=poll, daemon=True)
+    t.start()
 
 # ══════════════════════════════════════════════
 # TELEGRAM
@@ -1099,6 +1168,10 @@ def run_loop(mode: str):
     start_time = time.time()
     max_duration = 19800
     cycle_count = 0
+    current_mode = mode
+
+    listen_tg_commands()
+    save_mode(mode)
 
     log(f"🔄 Continuous loop started — interval={SCAN_INTERVAL}s, max_duration={max_duration}s ({max_duration//3600}j)")
     tg(f"🔄 <b>Bandar Tracker Continuous</b> — Mode {mode}, interval {SCAN_INTERVAL}s, max {max_duration//3600}j")
@@ -1110,19 +1183,25 @@ def run_loop(mode: str):
             tg(f"⏰ <b>Bandar Tracker selesai</b> — {cycle_count} cycle dalam {elapsed/3600:.1f} jam")
             break
 
+        new_mode = load_mode()
+        if new_mode and new_mode != current_mode:
+            current_mode = new_mode
+            log(f"Mode changed to {current_mode} via Telegram", "📱 ")
+            tg(f"📱 <b>Mode diubah ke {current_mode}</b> — mulai cycle berikutnya")
+
         cycle_count += 1
         log(f"🔄 Cycle #{cycle_count} ({elapsed/3600:.2f}h elapsed)")
         cycle_start = time.time()
-        tg(f"🔄 <b>Cycle #{cycle_count}</b> — {elapsed/3600:.1f}h elapsed, menjalankan mode {mode}...")
+        tg(f"🔄 <b>Cycle #{cycle_count}</b> — {elapsed/3600:.1f}h elapsed, mode {current_mode}...")
 
-        if mode == "2":
+        if current_mode == "2":
             for addr in tracked_wallets:
                 sigs = rpc("getSignaturesForAddress", [addr, {"limit": 10}]) or []
                 for s in sigs: seen_sigs.add(s["signature"])
             track_once()
-        elif mode == "6":
+        elif current_mode == "6":
             auto_discover_once()
-        elif mode == "7":
+        elif current_mode == "7":
             for addr in tracked_wallets:
                 sigs = rpc("getSignaturesForAddress", [addr, {"limit": 10}]) or []
                 for s in sigs: seen_sigs.add(s["signature"])

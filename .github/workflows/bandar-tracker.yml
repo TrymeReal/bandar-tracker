@@ -30,6 +30,7 @@ jobs:
             seen_sigs.json
             seen_mints.json
             wallets.json
+            mode.json
           key: bandar-tracker-${{ github.run_id }}
           restore-keys: bandar-tracker-
 
