@@ -42,3 +42,4 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TG_THREAD: ${{ secrets.TG_THREAD }}
           HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          GMGN_API_KEY: ${{ secrets.GMGN_API_KEY }}
