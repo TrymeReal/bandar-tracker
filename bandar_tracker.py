@@ -216,22 +216,23 @@ def listen_tg_commands():
                         continue
                     if TELEGRAM_THREAD and thread_id != TELEGRAM_THREAD:
                         continue
-                    if not text.startswith("/mode"):
+                    if text.startswith("/mode"):
+                        parts = text.split()
+                        if len(parts) != 2 or not parts[1].isdigit():
+                            tg("❌ Format: <code>/mode &lt;angka&gt;</code> — contoh: <code>/mode 6</code>")
+                            continue
+                        mode_raw = parts[1]
+                    elif text.isdigit():
+                        mode_raw = text
+                    else:
+                        continue
+                    if mode_raw not in ("1", "2", "3", "4", "5", "6", "7"):
+                        tg(f"❌ Mode {mode_raw} tidak dikenal. Pilih 1-7")
                         continue
 
-                    parts = text.split()
-                    if len(parts) != 2 or not parts[1].isdigit():
-                        tg("❌ Format: <code>/mode &lt;angka&gt;</code> — contoh: <code>/mode 6</code>")
-                        continue
-
-                    new_mode = parts[1]
-                    if new_mode not in ("1", "2", "3", "4", "5", "6", "7"):
-                        tg(f"❌ Mode {new_mode} tidak dikenal. Pilih 1-7")
-                        continue
-
-                    save_mode(new_mode)
-                    tg(f"✅ Mode diubah ke <b>{new_mode}</b> — akan aktif di cycle berikutnya")
-                    log(f"Mode changed to {new_mode} via Telegram", "📱 ")
+                    save_mode(mode_raw)
+                    tg(f"✅ Mode diubah ke <b>{mode_raw}</b> — akan aktif di cycle berikutnya")
+                    log(f"Mode changed to {mode_raw} via Telegram", "📱 ")
             except:
                 pass
             time.sleep(3)
