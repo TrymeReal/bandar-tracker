@@ -35,7 +35,7 @@ jobs:
           restore-keys: bandar-tracker-
 
       - name: Run tracker
-        run: python bandar_tracker.py --ci --mode 7
+        run: python bandar_tracker.py --ci --mode 2
         env:
           CI: 'false'
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
