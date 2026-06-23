@@ -36,6 +36,10 @@ TELEGRAM_THREAD  = int(_env.get("TG_THREAD") or os.environ.get("TG_THREAD") or "
 
 HELIUS_API_KEY   = _env.get("HELIUS_API_KEY") or os.environ.get("HELIUS_API_KEY", "")
 GMGN_API_KEY     = _env.get("GMGN_API_KEY") or os.environ.get("GMGN_API_KEY", "")
+
+GIST_ID          = "7872aefdf9114d37a56a1e9187406800"
+GITHUB_TOKEN     = _env.get("GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
+
 RPC_FALLBACK     = "https://api.mainnet-beta.solana.com"
 
 # Mode auto-scan
@@ -582,6 +586,31 @@ def process_token(token: dict):
         )
         log(f"  → Alert sent! Score {score}/100 | {sol_spent:.2f}SOL", "✅ ")
         tg(msg)
+        write_to_gist(mint)
+
+def write_to_gist(mint: str):
+    if not GITHUB_TOKEN or not GIST_ID:
+        return
+    try:
+        r = requests.get(
+            f"https://api.github.com/gists/{GIST_ID}",
+            headers={"Authorization": f"token {GITHUB_TOKEN}"},
+            timeout=5
+        )
+        content = r.json()["files"]["confirmed_bandars.json"]["content"]
+        data = json.loads(content)
+        if mint not in data:
+            data.append(mint)
+            data = data[-200:]
+            requests.patch(
+                f"https://api.github.com/gists/{GIST_ID}",
+                headers={"Authorization": f"token {GITHUB_TOKEN}"},
+                json={"files": {"confirmed_bandars.json": {"content": json.dumps(data)}}},
+                timeout=5
+            )
+            log(f"CA {mint[:8]}... ditulis ke Gist ✅", "🔗 ")
+    except Exception as e:
+        log(f"Gagal tulis Gist: {e}", "⚠️ ")
 
 def auto_scan_once():
     tokens = fetch_new_tokens()
@@ -663,6 +692,7 @@ def _handle_ws_token(sig, mint, owner, sol_spent=0):
             f"<a href='https://gmgn.ai/sol/address/{esc(owner)}'>GMGN</a>"
         )
         tg(msg)
+        write_to_gist(mint)
 
 def ws_scan_loop():
     if not HELIUS_API_KEY:
