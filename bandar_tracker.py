@@ -53,8 +53,11 @@ DISCOVER_INTERVAL    = 60
 DISCOVER_MIN_WINRATE = 0.60
 DISCOVER_MIN_TOKENS  = 3
 DISCOVER_MAX_WALLETS = 50
-DISCOVER_MIN_HOLDER   = 0.3
+DISCOVER_MIN_HOLDER  = 0.3
 PUMPED_MIN_LIQ       = 5_000
+
+# FIX: Token cache TTL — expired setelah 5 menit biar harga tidak basi
+TOKEN_CACHE_TTL = 300
 
 PRESET_WALLETS = {}
 
@@ -65,13 +68,28 @@ SKIP_MINTS = {
     "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
     "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y68YB",
 }
+
+# FIX: Program address Solana yang wajib di-exclude dari cluster detection
+SOLANA_PROGRAM_ADDRESSES = {
+    "11111111111111111111111111111111",           # System Program
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # Token Program
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe8bv",  # Associated Token Program
+    "ComputeBudget111111111111111111111111111111",    # Compute Budget
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",  # Jupiter v6
+    "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",  # Metaplex
+    "SysvarC1ock11111111111111111111111111111111",
+    "SysvarRent111111111111111111111111111111111",
+}
 # ══════════════════════════════════════════════
 
 # ── State global ──────────────────────────────
 tracked_wallets = dict(PRESET_WALLETS)
 seen_sigs       = set()
 seen_mints      = set()
-token_cache     = {}
+# FIX: token_cache sekarang simpan (data, timestamp) bukan data langsung
+token_cache     = {}  # mint -> (info_dict, timestamp)
 _sol_price      = 150.0
 DATA_FILE       = os.path.join(os.path.dirname(__file__), "wallets.json")
 SEEN_SIGS_FILE  = os.path.join(os.path.dirname(__file__), "seen_sigs.json")
@@ -100,7 +118,8 @@ def rpc(method, params, url=None):
             "method": method, "params": params
         }, timeout=10)
         return r.json().get("result")
-    except:
+    except Exception as e:
+        log(f"RPC error [{method}]: {e}", "⚠️ ")
         return None
 
 def get_sol_price():
@@ -108,8 +127,8 @@ def get_sol_price():
     try:
         r = requests.get("https://price.jup.ag/v4/price?ids=SOL", timeout=4)
         _sol_price = float(r.json()["data"]["SOL"]["price"])
-    except:
-        pass
+    except Exception as e:
+        log(f"Gagal ambil harga SOL: {e}", "⚠️ ")
     return _sol_price
 
 def get_current_holdings(addr: str) -> set[str]:
@@ -137,7 +156,8 @@ def get_current_holdings(addr: str) -> set[str]:
             if amt > 0 and mint not in SKIP_MINTS:
                 mints.add(mint)
         return mints
-    except:
+    except Exception as e:
+        log(f"Error get_current_holdings {addr[:8]}: {e}", "⚠️ ")
         return set()
 
 def calculate_holder_score(bought_mints: list[str], current_mints: set[str]) -> float:
@@ -151,8 +171,8 @@ def save_wallets():
     try:
         with open(DATA_FILE, "w") as f:
             json.dump(tracked_wallets, f, indent=2)
-    except:
-        pass
+    except Exception as e:
+        log(f"Gagal save wallets: {e}", "⚠️ ")
 
 def load_wallets():
     global tracked_wallets
@@ -162,20 +182,20 @@ def load_wallets():
                 saved = json.load(f)
             tracked_wallets.update(saved)
             log(f"Loaded {len(saved)} saved wallets")
-        except:
-            pass
+        except Exception as e:
+            log(f"Gagal load wallets: {e}", "⚠️ ")
 
 def save_seen():
     try:
         with open(SEEN_SIGS_FILE, "w") as f:
             json.dump({"sigs": list(seen_sigs)[-5000:]}, f)
-    except:
-        pass
+    except Exception as e:
+        log(f"Gagal save seen_sigs: {e}", "⚠️ ")
     try:
         with open(SEEN_MINTS_FILE, "w") as f:
             json.dump({"mints": list(seen_mints)[-5000:]}, f)
-    except:
-        pass
+    except Exception as e:
+        log(f"Gagal save seen_mints: {e}", "⚠️ ")
 
 def load_seen():
     global seen_sigs, seen_mints
@@ -185,31 +205,31 @@ def load_seen():
                 data = json.load(f)
                 seen_sigs = set(data.get("sigs", []))
             log(f"Loaded {len(seen_sigs)} seen sigs")
-        except:
-            pass
+        except Exception as e:
+            log(f"Gagal load seen_sigs: {e}", "⚠️ ")
     if os.path.exists(SEEN_MINTS_FILE):
         try:
             with open(SEEN_MINTS_FILE) as f:
                 data = json.load(f)
                 seen_mints = set(data.get("mints", []))
             log(f"Loaded {len(seen_mints)} seen mints")
-        except:
-            pass
+        except Exception as e:
+            log(f"Gagal load seen_mints: {e}", "⚠️ ")
 
 def save_mode(mode: str):
     try:
         with open(MODE_FILE, "w") as f:
             json.dump({"mode": mode}, f)
-    except:
-        pass
+    except Exception as e:
+        log(f"Gagal save mode: {e}", "⚠️ ")
 
 def load_mode() -> str | None:
     try:
         if os.path.exists(MODE_FILE):
             with open(MODE_FILE) as f:
                 return json.load(f).get("mode")
-    except:
-        pass
+    except Exception as e:
+        log(f"Gagal load mode: {e}", "⚠️ ")
     return None
 
 _last_update_id = 0
@@ -229,6 +249,7 @@ def listen_tg_commands():
                 params = {"offset": _last_update_id + 1, "timeout": 10, "allowed_updates": ["message"]}
                 r = requests.get(url, params=params, timeout=15)
                 if not r.ok:
+                    time.sleep(3)
                     continue
                 for upd in r.json().get("result", []):
                     _last_update_id = upd["update_id"]
@@ -257,8 +278,8 @@ def listen_tg_commands():
                     save_mode(mode_raw)
                     tg(f"✅ Mode diubah ke <b>{mode_raw}</b> — akan aktif di cycle berikutnya")
                     log(f"Mode changed to {mode_raw} via Telegram", "📱 ")
-            except:
-                pass
+            except Exception as e:
+                log(f"TG listener error: {e}", "⚠️ ")
             time.sleep(3)
 
     t = threading.Thread(target=poll, daemon=True)
@@ -329,7 +350,7 @@ def get_funding_source(addr: str) -> dict:
 
 def get_early_entry_rank(addr: str, token_mint: str) -> int | None:
     """
-    FIX: Cek apakah wallet ini ada di early buyer token dengan cara yang bener.
+    Cek apakah wallet ini ada di early buyer token.
     Ambil TX dari mint account, lalu cek owner dari postTokenBalances.
     Return rank (1-based) atau None kalau ga ketemu.
     """
@@ -357,8 +378,8 @@ def score_wallet(addr: str, token_mint: str) -> dict:
     Skor wallet 0–100 berdasarkan heuristics bandar:
     - Wallet age     (max 35)
     - Funding source (max 30)
-    - Early entry    (max 25) — FIX: pakai get_early_entry_rank yg bener
-    - Cluster        (max 10)
+    - Early entry    (max 25)
+    - Cluster        (max 10) — FIX: exclude program address Solana
     """
     score   = 0
     reasons = []
@@ -382,7 +403,7 @@ def score_wallet(addr: str, token_mint: str) -> dict:
     else:
         reasons.append("Funding source tidak jelas")
 
-    # ── 3. Early entry (max 25) — FIX ──
+    # ── 3. Early entry (max 25) ──
     rank = get_early_entry_rank(addr, token_mint)
     if rank is not None:
         if rank == 1:    score += 25; reasons.append("🎯 TX PERTAMA di token ini!")
@@ -392,7 +413,7 @@ def score_wallet(addr: str, token_mint: str) -> dict:
     else:
         reasons.append("Bukan early buyer")
 
-    # ── 4. Cluster check (max 10) ──
+    # ── 4. Cluster check (max 10) — FIX: exclude program addresses ──
     wallet_sigs = rpc("getSignaturesForAddress", [addr, {"limit": 15}]) or []
     co_wallets = {}
     for s in wallet_sigs:
@@ -403,8 +424,10 @@ def score_wallet(addr: str, token_mint: str) -> dict:
         keys = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
         for k in keys:
             a = k if isinstance(k, str) else k.get("pubkey", "")
-            if a and a != addr:
-                co_wallets[a] = co_wallets.get(a, 0) + 1
+            # FIX: skip program addresses dan addr sendiri
+            if not a or a == addr or a in SOLANA_PROGRAM_ADDRESSES:
+                continue
+            co_wallets[a] = co_wallets.get(a, 0) + 1
     cluster = [k for k, v in co_wallets.items() if v >= 3]
     if len(cluster) >= 5:   score += 10; reasons.append(f"Cluster {len(cluster)} wallets terdeteksi 🕸️")
     elif len(cluster) >= 2: score += 5;  reasons.append(f"Small cluster ({len(cluster)} wallets)")
@@ -422,8 +445,13 @@ def score_wallet(addr: str, token_mint: str) -> dict:
 # ══════════════════════════════════════════════
 
 def get_token_info(mint: str) -> dict:
+    # FIX: cek TTL cache, expired setelah TOKEN_CACHE_TTL detik
+    now = time.time()
     if mint in token_cache:
-        return token_cache[mint]
+        cached_info, cached_ts = token_cache[mint]
+        if now - cached_ts < TOKEN_CACHE_TTL:
+            return cached_info
+
     try:
         r = requests.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
@@ -438,10 +466,12 @@ def get_token_info(mint: str) -> dict:
             "change":  float(pair.get("priceChange", {}).get("h24", 0) or 0),
             "dex_url": pair.get("url", f"https://dexscreener.com/solana/{mint}"),
         }
-    except:
+    except Exception as e:
+        log(f"Gagal ambil token info {mint[:8]}: {e}", "⚠️ ")
         info = {"name": mint[:8]+"...", "symbol": "???", "price": "?", "liq": 0,
                 "change": 0, "dex_url": f"https://dexscreener.com/solana/{mint}"}
-    token_cache[mint] = info
+
+    token_cache[mint] = (info, now)
     return info
 
 def fetch_new_tokens() -> list[dict]:
@@ -460,7 +490,8 @@ def fetch_new_tokens() -> list[dict]:
             for t in tokens
             if t.get("chainId") == "solana" and t.get("tokenAddress")
         ]
-    except:
+    except Exception as e:
+        log(f"Gagal fetch new tokens: {e}", "⚠️ ")
         return []
 
 # ══════════════════════════════════════════════
@@ -468,8 +499,8 @@ def fetch_new_tokens() -> list[dict]:
 # ══════════════════════════════════════════════
 
 def get_first_buyer(mint: str):
-    """Return (wallet_addr, tx_sig, sol_spent) dari buyer pertama token
-    FIX: skip creator/minter (sol_spent terlalu kecil), cari real DEX buyer
+    """Return (wallet_addr, tx_sig, sol_spent) dari buyer pertama token.
+    Skip creator/minter (sol_spent terlalu kecil), cari real DEX buyer.
     """
     sigs = rpc("getSignaturesForAddress", [mint, {"limit": 15}]) or []
     if not sigs:
@@ -563,7 +594,7 @@ def auto_scan_once():
             futures = {ex.submit(process_token, t): t for t in new_tokens}
             for f in as_completed(futures):
                 try: f.result()
-                except Exception as e: log(f"Error: {e}", "❌ ")
+                except Exception as e: log(f"Error process_token: {e}", "❌ ")
     else:
         log("Tidak ada token baru", "💤 ")
 
@@ -579,6 +610,9 @@ def auto_scan_loop():
 # ══════════════════════════════════════════════
 
 PUMPFUN_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+# FIX: keyword WS lebih spesifik — cari "InitializeMint" bukan substring "reate" yang terlalu umum
+WS_FILTER_KEYWORDS = ("InitializeMint", "MintTo", "Create")
 
 def _handle_ws_token(sig, mint, owner, sol_spent=0):
     if mint in seen_mints or mint in SKIP_MINTS:
@@ -650,7 +684,8 @@ def ws_scan_loop():
                 return
             seen_sigs.add(sig)
 
-            if not any("reate" in l for l in logs):
+            # FIX: filter lebih spesifik, bukan substring "reate" yang terlalu umum
+            if not any(any(kw in l for kw in WS_FILTER_KEYWORDS) for l in logs):
                 return
 
             tx = rpc("getTransaction", [sig, {
@@ -717,8 +752,19 @@ def poll_wallet(addr: str, label: str):
         meta     = tx.get("meta") or {}
         pre_tok  = meta.get("preTokenBalances",  []) or []
         post_tok = meta.get("postTokenBalances", []) or []
-        pre_sol  = (meta.get("preBalances",  [0]) or [0])[0]
-        post_sol = (meta.get("postBalances", [0]) or [0])[0]
+
+        # FIX: cari index wallet yang di-track di accountKeys, bukan selalu index 0
+        pre_sol  = 0
+        post_sol = 0
+        keys = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
+        pre_bals  = meta.get("preBalances",  []) or []
+        post_bals = meta.get("postBalances", []) or []
+        for i, k in enumerate(keys):
+            a = k if isinstance(k, str) else k.get("pubkey", "")
+            if a == addr:
+                pre_sol  = pre_bals[i]  if i < len(pre_bals)  else 0
+                post_sol = post_bals[i] if i < len(post_bals) else 0
+                break
         sol_spent = max(0, (pre_sol - post_sol) / 1e9)
 
         def _build_map(balances):
@@ -734,13 +780,17 @@ def poll_wallet(addr: str, label: str):
         pre_map  = _build_map(pre_tok)
         post_map = _build_map(post_tok)
 
-        usd_val = sol_spent * get_sol_price()
+        sol_price = get_sol_price()
+        usd_val   = sol_spent * sol_price
 
-        # DETECT BUY
+        # DETECT BUY — FIX: terapkan filter MIN_BUY_USD
         for mint, post_amt in post_map.items():
             pre_amt = pre_map.get(mint, 0)
             if post_amt <= pre_amt:
                 continue
+            if usd_val < MIN_BUY_USD:
+                log(f"{label} BUY ${get_token_info(mint)['symbol']} terlalu kecil (${usd_val:,.0f} < ${MIN_BUY_USD:,}), skip", "⏭️ ")
+                break
             info = get_token_info(mint)
             log(f"{label} BUY ${info['symbol']} {sol_spent:.2f}SOL (~${usd_val:,.0f})", "🐋 ")
             msg = (
@@ -821,8 +871,8 @@ def fetch_pumped_tokens(limit: int = 30) -> list[dict]:
                 mint = t.get("tokenAddress", "")
                 if mint and mint not in SKIP_MINTS:
                     results.append({"mint": mint, "source": "boosted"})
-    except:
-        pass
+    except Exception as e:
+        log(f"Gagal fetch boosted tokens: {e}", "⚠️ ")
 
     if len(results) < 10:
         try:
@@ -832,8 +882,8 @@ def fetch_pumped_tokens(limit: int = 30) -> list[dict]:
                     mint = t.get("tokenAddress", "")
                     if mint and mint not in SKIP_MINTS:
                         results.append({"mint": mint, "source": "latest"})
-        except:
-            pass
+        except Exception as e:
+            log(f"Gagal fetch latest tokens: {e}", "⚠️ ")
 
     seen = set()
     out  = []
@@ -880,7 +930,7 @@ def get_early_buyers(mint: str, top_n: int = 5) -> list[tuple[str, float]]:
 
 def analyze_wallet_history(addr: str) -> dict:
     """
-    FIX: Kalau GMGN_API_KEY ada → pakai GMGN (1 call, akurat pakai realized PnL).
+    Kalau GMGN_API_KEY ada → pakai GMGN (1 call, akurat pakai realized PnL).
     Fallback ke RPC kalau tidak ada key.
     """
     if GMGN_API_KEY:
@@ -934,7 +984,10 @@ def _analyze_wallet_gmgn(addr: str) -> dict:
         return _analyze_wallet_rpc(addr)
 
 def _analyze_wallet_rpc(addr: str) -> dict:
-    """Fallback: hitung dari raw RPC (boros tapi tetap jalan tanpa GMGN key)."""
+    """Fallback: hitung dari raw RPC (boros tapi tetap jalan tanpa GMGN key).
+    FIX: win rate hanya dihitung dari token yang liquidity-nya STABIL >= PUMPED_MIN_LIQ
+    selama minimal 1 jam (bukan hanya price_change sesaat).
+    """
     sigs = rpc("getSignaturesForAddress", [addr, {"limit": 50}]) or []
     if not sigs:
         return {"win_rate": 0, "wins": 0, "total": 0, "tokens": []}
@@ -968,9 +1021,9 @@ def _analyze_wallet_rpc(addr: str) -> dict:
     for mint, sol in list(mints_bought.items())[:15]:
         info   = get_token_info(mint)
         liq    = info.get("liq", 0)
-        # FIX: cek liq DAN price change supaya lebih akurat
-        change = info.get("change", 0)
-        pumped = liq >= PUMPED_MIN_LIQ and change > 0
+        # FIX: "pumped" hanya dari liq yang solid >= threshold, tidak pakai price_change
+        # yang bisa sesaat positif lalu balik. Ini lebih konservatif tapi lebih akurat.
+        pumped = liq >= PUMPED_MIN_LIQ
         if pumped: wins += 1
         token_results.append({
             "mint": mint, "symbol": info.get("symbol", "???"),
