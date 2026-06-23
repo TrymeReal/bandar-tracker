@@ -38,7 +38,7 @@ HELIUS_API_KEY   = _env.get("HELIUS_API_KEY") or os.environ.get("HELIUS_API_KEY"
 GMGN_API_KEY     = _env.get("GMGN_API_KEY") or os.environ.get("GMGN_API_KEY", "")
 
 GIST_ID          = "7872aefdf9114d37a56a1e9187406800"
-GITHUB_TOKEN     = _env.get("GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
+GITHUB_TOKEN     = _env.get("GH_TOKEN") or os.environ.get("GH_TOKEN", "")
 
 RPC_FALLBACK     = "https://api.mainnet-beta.solana.com"
 
