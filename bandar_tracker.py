@@ -912,7 +912,7 @@ def _analyze_wallet_gmgn(addr: str) -> dict:
         wins            = round(win_rate * total_trades)
 
         token_results = []
-        for t in (data.get("token_list") or [])[:5]:
+        for t in (data.get("token_list") or []):
             token_results.append({
                 "mint":   t.get("address", ""),
                 "symbol": t.get("symbol", "???"),
