@@ -20,7 +20,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests websocket-client
+        run: pip install requests
 
       - name: Restore cache
         id: cache-data
@@ -28,17 +28,14 @@ jobs:
         with:
           path: |
             seen_sigs.json
-            seen_mints.json
-            mode.json
           key: bandar-tracker-${{ github.run_id }}
           restore-keys: bandar-tracker-
 
       - name: Run tracker
-        run: python bandar_tracker.py --ci --mode 2
+        run: python bandar_tracker.py --ci
         env:
           CI: 'false'
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TG_THREAD: ${{ secrets.TG_THREAD }}
           HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
-          GMGN_API_KEY: ${{ secrets.GMGN_API_KEY }}
