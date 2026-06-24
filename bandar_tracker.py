@@ -813,16 +813,30 @@ def poll_wallet(addr: str, label: str):
         sol_price = get_sol_price()
         usd_val   = sol_spent * sol_price
 
-        # DETECT BUY — FIX: terapkan filter MIN_BUY_USD
+        # DETECT BUY
+        # FIX: nilai USD buy dihitung dari token yang dibeli * harga token,
+        # BUKAN dari delta SOL native. Mayoritas swap DEX pakai Wrapped SOL,
+        # jadi saldo SOL native cuma berubah sebesar fee (~$0) dan bikin
+        # semua buy ke-skip. Pakai continue (bukan break) supaya token lain
+        # di tx yang sama tetap diperiksa.
         for mint, post_amt in post_map.items():
             pre_amt = pre_map.get(mint, 0)
             if post_amt <= pre_amt:
                 continue
-            if usd_val < MIN_BUY_USD:
-                log(f"{label} BUY ${get_token_info(mint)['symbol']} terlalu kecil (${usd_val:,.0f} < ${MIN_BUY_USD:,}), skip", "⏭️ ")
-                break
+            bought_amt = post_amt - pre_amt
             info = get_token_info(mint)
-            log(f"{label} BUY ${info['symbol']} {sol_spent:.2f}SOL (~${usd_val:,.0f})", "🐋 ")
+            try:
+                price = float(str(info.get("price", 0)).replace("$", "").replace(",", "") or 0)
+            except (ValueError, TypeError):
+                price = 0
+            buy_usd = bought_amt * price
+
+            # Token baru sering belum ada harga (buy_usd == 0) -> jangan dibuang,
+            # tetap di-alert. Hanya skip kalau harga diketahui DAN di bawah ambang.
+            if buy_usd and buy_usd < MIN_BUY_USD:
+                log(f"{label} BUY ${info['symbol']} terlalu kecil (${buy_usd:,.0f} < ${MIN_BUY_USD:,}), skip", "⏭️ ")
+                continue
+            log(f"{label} BUY ${info['symbol']} {bought_amt:,.4f} (~${buy_usd:,.0f})", "🐋 ")
             msg = (
                 f"🟢 <b>BUY</b>\n"
                 f"━━━━━━━━━━━━━━━━━\n\n"
@@ -830,7 +844,7 @@ def poll_wallet(addr: str, label: str):
                 f"<code>{esc(addr)}</code>\n\n"
                 f"<b>Token</b>: ${esc(info['symbol'])} ({esc(info['name'])})\n"
                 f"<b>CA</b>: <code>{esc(mint)}</code>\n"
-                f"<b>Amount</b>: {sol_spent:.2f} SOL (~${usd_val:,.0f})\n"
+                f"<b>Amount</b>: {bought_amt:,.4f} {esc(info['symbol'])} (~${buy_usd:,.0f})\n"
                 f"<b>Price</b>: ${esc(info['price'])}\n\n"
                 f"<a href='https://solscan.io/tx/{esc(sig)}'>TX</a> | "
                 f"<a href='{esc(info['dex_url'])}'>DexScreener</a> | "
