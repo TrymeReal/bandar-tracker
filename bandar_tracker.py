@@ -464,6 +464,12 @@ def record_sell(addr, mint, usd_recv, sold_tokens):
     pos = positions.get(addr, {}).get(mint)
     if not pos or pos["tokens"] <= 0:
         return None
+    # Jual lebih banyak dari yang bot lihat dibeli → ada stok lama (sebelum bot baca history).
+    # Cost basis tak lengkap → jangan dihitung biar /stats ga ngaco. Reset posisi.
+    if sold_tokens > pos["tokens"] * 1.01:
+        pos["tokens"] = 0.0
+        pos["usd_in"] = 0.0
+        return None
     frac = min(1.0, sold_tokens / pos["tokens"]) if pos["tokens"] else 1.0
     cost = pos["usd_in"] * frac
     pos["usd_in"]  -= cost
