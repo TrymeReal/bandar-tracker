@@ -82,6 +82,8 @@ token_cache     = {}
 _sol_price      = 150.0
 
 positions       = {}   # {addr: {mint: {"usd_in": float, "tokens": float}}}
+stats           = {}   # {addr: {"realized": float, "wins": int, "trades": int}}
+backfilled      = set()# wallet yang cost-basis-nya sudah di-backfill dari history
 recent_buys     = {}   # {mint: [[label, ts], ...]}   untuk deteksi cluster
 cluster_alerted = {}   # {mint: ts}                    biar ga spam cluster
 tg_offset       = 0    # offset getUpdates Telegram
@@ -217,14 +219,19 @@ def load_seen():
         log(f"Loaded {len(seen_sigs)} seen sigs")
 
 def save_state():
-    _save_json(POSITIONS_FILE, {"positions": positions}, "positions")
+    _save_json(POSITIONS_FILE,
+               {"positions": positions, "stats": stats, "backfilled": list(backfilled)},
+               "positions")
     _save_json(CLUSTER_FILE,
                {"recent_buys": recent_buys, "cluster_alerted": cluster_alerted},
                "cluster")
 
 def load_state():
-    global positions, recent_buys, cluster_alerted
-    positions = _load_json(POSITIONS_FILE, "positions", {}).get("positions", {})
+    global positions, stats, backfilled, recent_buys, cluster_alerted
+    d = _load_json(POSITIONS_FILE, "positions", {})
+    positions  = d.get("positions", {})
+    stats      = d.get("stats", {})
+    backfilled = set(d.get("backfilled", []))
     c = _load_json(CLUSTER_FILE, "cluster", {})
     recent_buys     = c.get("recent_buys", {})
     cluster_alerted = c.get("cluster_alerted", {})
@@ -280,7 +287,8 @@ def handle_command(text: str):
         tg("🤖 <b>Perintah Wallet Tracker</b>\n"
            "/add &lt;wallet&gt; [nama] — tambah wallet\n"
            "/remove &lt;wallet|nama&gt; — hapus wallet\n"
-           "/list — daftar wallet di-track")
+           "/list — daftar wallet di-track\n"
+           "/stats — leaderboard PnL per wallet")
 
     elif cmd == "add":
         if not args:
@@ -292,9 +300,11 @@ def handle_command(text: str):
         is_new = w not in tracked_wallets
         tracked_wallets[w] = label
         save_wallets()
-        # seed signature terakhir biar ga kirim notif historis
-        for s in (rpc("getSignaturesForAddress", [w, {"limit": 1}]) or []):
-            seen_sigs.add(s["signature"])
+        # backfill cost-basis + seed seen_sigs (skip notif historis)
+        try:
+            backfill_wallet(w)
+        except Exception as e:
+            log(f"Backfill gagal {w[:8]}: {e}", "⚠️ ")
         tg(f"{'✅ Ditambahkan' if is_new else '✏️ Diperbarui'}: <b>{esc(label)}</b>\n"
            f"<code>{esc(w)}</code>")
         log(f"CMD add: {label} ({w[:8]})", "💬 ")
@@ -323,6 +333,24 @@ def handle_command(text: str):
         lines = ["📋 <b>Wallet di-track</b>:"]
         for a in tracked_wallets:
             lines.append(f"• <b>{esc(_label_of(a))}</b> — <code>{esc(a)}</code>")
+        tg("\n".join(lines))
+
+    elif cmd in ("stats", "pnl"):
+        rows = [(a, s) for a, s in stats.items() if s.get("trades")]
+        if not rows:
+            tg("📊 Belum ada trade lengkap (beli+jual) yang kebaca bot."); return
+        rows.sort(key=lambda x: x[1]["realized"], reverse=True)
+        lines = ["📊 <b>Leaderboard PnL</b> <i>(trade yg kebaca bot)</i>"]
+        total = 0.0
+        for a, s in rows:
+            total += s["realized"]
+            wr   = s["wins"] / s["trades"] * 100 if s["trades"] else 0
+            sign = "🟢" if s["realized"] >= 0 else "🔴"
+            lines.append(
+                f"{sign} <b>{esc(_label_of(a))}</b>: ${s['realized']:+,.0f} "
+                f"({s['trades']} trade, {wr:.0f}% win)"
+            )
+        lines.append(f"\n<b>Total</b>: ${total:+,.0f}")
         tg("\n".join(lines))
 
     else:
@@ -445,6 +473,11 @@ def record_sell(addr, mint, usd_recv, sold_tokens):
     if cost <= 0:
         return None
     pnl = usd_recv - cost
+    st = stats.setdefault(addr, {"realized": 0.0, "wins": 0, "trades": 0})
+    st["realized"] += pnl
+    st["trades"]   += 1
+    if pnl > 0:
+        st["wins"] += 1
     return {"cost": cost, "pnl": pnl, "pct": pnl / cost * 100}
 
 # ══════════════════════════════════════════════
@@ -471,6 +504,94 @@ def note_buy_for_cluster(mint, label):
 # TRACK MODE — deteksi BUY & SELL
 # ══════════════════════════════════════════════
 
+def parse_tx(tx, addr, sol_price):
+    """Ekstrak perubahan token + nilai USD dari satu transaksi untuk `addr`.
+    Return dict: changes {mint: delta}, usd_spent, usd_recv, sol_spent, sol_recv."""
+    meta     = tx.get("meta") or {}
+    pre_tok  = meta.get("preTokenBalances",  []) or []
+    post_tok = meta.get("postTokenBalances", []) or []
+
+    keys = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
+    wallet_indices = set()
+    pre_sol = post_sol = 0
+    pre_bals  = meta.get("preBalances",  []) or []
+    post_bals = meta.get("postBalances", []) or []
+
+    for i, k in enumerate(keys):
+        a = k if isinstance(k, str) else k.get("pubkey", "")
+        if a == addr:
+            wallet_indices.add(i)
+            pre_sol  = pre_bals[i]  if i < len(pre_bals)  else 0
+            post_sol = post_bals[i] if i < len(post_bals) else 0
+            break
+
+    sol_spent = max(0, (pre_sol - post_sol) / 1e9)
+    sol_recv  = max(0, (post_sol - pre_sol) / 1e9)
+
+    def _delta(balances, only=None, skip=None):
+        m = {}
+        for p in balances:
+            owner   = p.get("owner", "")
+            acc_idx = p.get("accountIndex", -1)
+            mint    = p.get("mint", "")
+            if only is not None and mint not in only:
+                continue
+            if skip is not None and mint in skip:
+                continue
+            if owner != addr and acc_idx not in wallet_indices:
+                continue
+            amt = float(p.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
+            m[mint] = m.get(mint, 0) + amt
+        return m
+
+    pre_map   = _delta(pre_tok,  skip=SKIP_MINTS)
+    post_map  = _delta(post_tok, skip=SKIP_MINTS)
+    pre_stab  = _delta(pre_tok,  only=STABLE_MINTS)
+    post_stab = _delta(post_tok, only=STABLE_MINTS)
+
+    all_stab     = set(pre_stab) | set(post_stab)
+    stable_spent = sum(max(0, pre_stab.get(m, 0)  - post_stab.get(m, 0)) for m in all_stab)
+    stable_recv  = sum(max(0, post_stab.get(m, 0) - pre_stab.get(m, 0))  for m in all_stab)
+
+    changes = {}
+    for m in set(pre_map) | set(post_map):
+        d = post_map.get(m, 0) - pre_map.get(m, 0)
+        if d != 0:
+            changes[m] = d
+
+    return {
+        "changes":   changes,
+        "sol_spent": sol_spent, "sol_recv": sol_recv,
+        "usd_spent": sol_spent * sol_price + stable_spent,
+        "usd_recv":  sol_recv  * sol_price + stable_recv,
+    }
+
+def backfill_wallet(addr, limit=100):
+    """Baca history wallet → rekonstruksi cost-basis & PnL lama.
+    Sekalian seed seen_sigs biar tx historis ga di-notif ulang."""
+    if addr in backfilled:
+        return
+    sigs = rpc("getSignaturesForAddress", [addr, {"limit": limit}]) or []
+    sol_price = _sol_price or 150.0
+    for s in reversed(sigs):                       # urut lama → baru
+        seen_sigs.add(s["signature"])
+        if s.get("err"):
+            continue
+        tx = rpc("getTransaction", [s["signature"], {
+            "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0
+        }])
+        if not tx or (tx.get("meta") or {}).get("err"):
+            continue
+        p = parse_tx(tx, addr, sol_price)
+        for mint, delta in p["changes"].items():
+            if delta > 0:
+                record_buy(addr, mint, p["usd_spent"], delta)
+            else:
+                record_sell(addr, mint, p["usd_recv"], -delta)
+    backfilled.add(addr)
+    n = len(positions.get(addr, {}))
+    log(f"Backfill {_label_of(addr)}: {n} posisi dari {len(sigs)} tx", "📚 ")
+
 def poll_wallet(addr: str, label: str):
     sigs = rpc("getSignaturesForAddress", [addr, {"limit": 10}]) or []
     for s in reversed(sigs):
@@ -482,140 +603,88 @@ def poll_wallet(addr: str, label: str):
         tx = rpc("getTransaction", [sig, {
             "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0
         }])
-        if not tx:
+        if not tx or (tx.get("meta") or {}).get("err"):
             continue
-
-        meta     = tx.get("meta") or {}
-        pre_tok  = meta.get("preTokenBalances",  []) or []
-        post_tok = meta.get("postTokenBalances", []) or []
-
-        # Cari index wallet di accountKeys + perubahan saldo SOL
-        keys = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
-        wallet_indices = set()
-        pre_sol = post_sol = 0
-        pre_bals  = meta.get("preBalances",  []) or []
-        post_bals = meta.get("postBalances", []) or []
-
-        for i, k in enumerate(keys):
-            a = k if isinstance(k, str) else k.get("pubkey", "")
-            if a == addr:
-                wallet_indices.add(i)
-                pre_sol  = pre_bals[i]  if i < len(pre_bals)  else 0
-                post_sol = post_bals[i] if i < len(post_bals) else 0
-                break
-
-        sol_spent = max(0, (pre_sol - post_sol) / 1e9)
-        sol_recv  = max(0, (post_sol - pre_sol) / 1e9)
-
-        def _delta(balances, only=None, skip=None):
-            m = {}
-            for p in balances:
-                owner   = p.get("owner", "")
-                acc_idx = p.get("accountIndex", -1)
-                mint    = p.get("mint", "")
-                if only is not None and mint not in only:
-                    continue
-                if skip is not None and mint in skip:
-                    continue
-                if owner != addr and acc_idx not in wallet_indices:
-                    continue
-                amt = float(p.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
-                m[mint] = m.get(mint, 0) + amt
-            return m
-
-        # token target (exclude SOL/stable/LST)
-        pre_map  = _delta(pre_tok,  skip=SKIP_MINTS)
-        post_map = _delta(post_tok, skip=SKIP_MINTS)
-        # stablecoin (buat ngitung USD kalau bayar pakai USDC/USDT)
-        pre_stab  = _delta(pre_tok,  only=STABLE_MINTS)
-        post_stab = _delta(post_tok, only=STABLE_MINTS)
-
-        if not pre_map and not post_map:
-            continue
-
-        all_stab     = set(pre_stab) | set(post_stab)
-        stable_spent = sum(max(0, pre_stab.get(m, 0)  - post_stab.get(m, 0)) for m in all_stab)
-        stable_recv  = sum(max(0, post_stab.get(m, 0) - pre_stab.get(m, 0))  for m in all_stab)
 
         sol_price = _sol_price or get_sol_price()
-        usd_spent = sol_spent * sol_price + stable_spent
-        usd_recv  = sol_recv  * sol_price + stable_recv
+        p = parse_tx(tx, addr, sol_price)
+        if not p["changes"]:
+            continue
+        sol_spent, sol_recv = p["sol_spent"], p["sol_recv"]
+        usd_spent, usd_recv = p["usd_spent"], p["usd_recv"]
 
         def _spend_str(sol_amt, usd):
             if sol_amt * sol_price >= 0.01:
                 return f"{sol_amt:.3f} SOL (~${usd:,.0f})"
             return f"${usd:,.0f} (stablecoin)"
 
-        # ── DETECT BUY (token bertambah) ──
-        for mint, post_amt in post_map.items():
-            pre_amt = pre_map.get(mint, 0)
-            if post_amt <= pre_amt:
-                continue
-            got = post_amt - pre_amt
-            record_buy(addr, mint, usd_spent, got)   # akuntansi selalu jalan
+        for mint, delta in p["changes"].items():
+            # ── BUY (token bertambah) ──
+            if delta > 0:
+                got = delta
+                record_buy(addr, mint, usd_spent, got)   # akuntansi selalu jalan
+                if usd_spent < MIN_USD:                   # skip notif receh
+                    continue
 
-            if usd_spent < MIN_USD:                   # skip notif receh
-                continue
+                info    = get_token_info(mint)
+                cluster = note_buy_for_cluster(mint, label)
+                metas   = meta_line(info)
+                entry   = f"MC {fmt_usd(info['mcap'])} | harga ${esc(info['price'])}" \
+                          if info.get("mcap") else f"harga ${esc(info['price'])}"
+                log(f"{label} BUY ${info['symbol']} ~${usd_spent:,.0f}", "🟢 ")
+                msg = (
+                    f"🟢 <b>BUY</b>\n"
+                    f"━━━━━━━━━━━━━━━━━\n\n"
+                    f"<b>Wallet</b>: {esc(label)}\n"
+                    f"<code>{esc(addr)}</code>\n\n"
+                    f"<b>Token</b>: ${esc(info['symbol'])} ({esc(info['name'])})\n"
+                    f"<b>CA</b>: <code>{esc(mint)}</code>\n"
+                    f"<b>Beli</b>: {_spend_str(sol_spent, usd_spent)}\n"
+                    f"<b>Beli di</b>: {entry}\n"
+                    f"<b>Got</b>: {got:,.4f} token\n"
+                    + (f"{esc(metas)}\n" if metas else "")
+                    + f"\n"
+                    f"<a href='https://solscan.io/tx/{esc(sig)}'>TX</a> | "
+                    f"<a href='{esc(info['dex_url'])}'>DexScreener</a> | "
+                    f"<a href='https://gmgn.ai/sol/address/{esc(addr)}'>GMGN</a>"
+                )
+                tg(msg)
+                if cluster:
+                    send_cluster_alert(mint, info, cluster)
 
-            info    = get_token_info(mint)
-            cluster = note_buy_for_cluster(mint, label)
-            metas   = meta_line(info)
-            log(f"{label} BUY ${info['symbol']} ~${usd_spent:,.0f}", "🟢 ")
-            msg = (
-                f"🟢 <b>BUY</b>\n"
-                f"━━━━━━━━━━━━━━━━━\n\n"
-                f"<b>Wallet</b>: {esc(label)}\n"
-                f"<code>{esc(addr)}</code>\n\n"
-                f"<b>Token</b>: ${esc(info['symbol'])} ({esc(info['name'])})\n"
-                f"<b>CA</b>: <code>{esc(mint)}</code>\n"
-                f"<b>Amount</b>: {_spend_str(sol_spent, usd_spent)}\n"
-                f"<b>Got</b>: {got:,.4f} token\n"
-                f"<b>Price</b>: ${esc(info['price'])}\n"
-                + (f"{esc(metas)}\n" if metas else "")
-                + f"\n"
-                f"<a href='https://solscan.io/tx/{esc(sig)}'>TX</a> | "
-                f"<a href='{esc(info['dex_url'])}'>DexScreener</a> | "
-                f"<a href='https://gmgn.ai/sol/address/{esc(addr)}'>GMGN</a>"
-            )
-            tg(msg)
-
-            if cluster:
-                send_cluster_alert(mint, info, cluster)
-
-        # ── DETECT SELL (token berkurang) ──
-        for mint, pre_amt in pre_map.items():
-            post_amt = post_map.get(mint, 0)
-            if post_amt >= pre_amt:
-                continue
-            sold_amt = pre_amt - post_amt
-            pnl      = record_sell(addr, mint, usd_recv, sold_amt)  # akuntansi selalu jalan
-
-            if usd_recv < MIN_USD:
-                continue
-
-            info = get_token_info(mint)
-            if pnl:
-                sign    = "🟢" if pnl["pnl"] >= 0 else "🔴"
-                pnl_str = f"\n<b>PnL</b>: {sign} {pnl['pct']:+.0f}% (${pnl['pnl']:+,.0f})"
+            # ── SELL (token berkurang) ──
             else:
-                pnl_str = ""
-            log(f"{label} SELL {sold_amt:.4f} {info['symbol']} ~${usd_recv:,.0f}", "🔴 ")
-            msg = (
-                f"🔴 <b>SELL</b>\n"
-                f"━━━━━━━━━━━━━━━━━\n\n"
-                f"<b>Wallet</b>: {esc(label)}\n"
-                f"<code>{esc(addr)}</code>\n\n"
-                f"<b>Token</b>: ${esc(info['symbol'])} ({esc(info['name'])})\n"
-                f"<b>CA</b>: <code>{esc(mint)}</code>\n"
-                f"<b>Sold</b>: {sold_amt:,.4f} token\n"
-                f"<b>Got</b>: {_spend_str(sol_recv, usd_recv)}\n"
-                f"<b>Price</b>: ${esc(info['price'])}"
-                f"{pnl_str}\n\n"
-                f"<a href='https://solscan.io/tx/{esc(sig)}'>TX</a> | "
-                f"<a href='{esc(info['dex_url'])}'>DexScreener</a> | "
-                f"<a href='https://gmgn.ai/sol/address/{esc(addr)}'>GMGN</a>"
-            )
-            tg(msg)
+                sold_amt = -delta
+                pnl      = record_sell(addr, mint, usd_recv, sold_amt)  # akuntansi selalu jalan
+                if usd_recv < MIN_USD:
+                    continue
+
+                info = get_token_info(mint)
+                if pnl:
+                    sign    = "🟢" if pnl["pnl"] >= 0 else "🔴"
+                    pnl_str = (
+                        f"<b>Beli di</b>: ~${pnl['cost']:,.0f}  →  <b>Jual di</b>: ${usd_recv:,.0f}\n"
+                        f"<b>PnL</b>: {sign} {pnl['pct']:+.0f}% (${pnl['pnl']:+,.0f})\n"
+                    )
+                else:
+                    pnl_str = "<b>PnL</b>: ? (harga beli tak diketahui)\n"
+                log(f"{label} SELL {sold_amt:.4f} {info['symbol']} ~${usd_recv:,.0f}", "🔴 ")
+                msg = (
+                    f"🔴 <b>SELL</b>\n"
+                    f"━━━━━━━━━━━━━━━━━\n\n"
+                    f"<b>Wallet</b>: {esc(label)}\n"
+                    f"<code>{esc(addr)}</code>\n\n"
+                    f"<b>Token</b>: ${esc(info['symbol'])} ({esc(info['name'])})\n"
+                    f"<b>CA</b>: <code>{esc(mint)}</code>\n"
+                    f"<b>Sold</b>: {sold_amt:,.4f} token\n"
+                    f"<b>Jual</b>: {_spend_str(sol_recv, usd_recv)}\n"
+                    f"{pnl_str}"
+                    f"\n"
+                    f"<a href='https://solscan.io/tx/{esc(sig)}'>TX</a> | "
+                    f"<a href='{esc(info['dex_url'])}'>DexScreener</a> | "
+                    f"<a href='https://gmgn.ai/sol/address/{esc(addr)}'>GMGN</a>"
+                )
+                tg(msg)
 
 def send_cluster_alert(mint, info, wallets):
     log(f"CLUSTER {len(wallets)} wallet → ${info['symbol']}", "🚨 ")
@@ -648,10 +717,12 @@ def track_once():
     log("🎯 Selesai cek wallet", "🎯 ")
 
 def _seed_seen():
-    """Seed 1 tx terakhir tiap wallet biar ga notif historis."""
+    """Backfill cost-basis tiap wallet dari history + seed seen_sigs (skip notif historis)."""
     for addr in tracked_wallets:
-        for s in (rpc("getSignaturesForAddress", [addr, {"limit": 1}]) or []):
-            seen_sigs.add(s["signature"])
+        try:
+            backfill_wallet(addr)
+        except Exception as e:
+            log(f"Backfill gagal {addr[:8]}: {e}", "⚠️ ")
 
 def track_loop():
     if not tracked_wallets:
