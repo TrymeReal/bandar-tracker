@@ -39,18 +39,16 @@ HELIUS_API_KEY   = _env.get("HELIUS_API_KEY") or os.environ.get("HELIUS_API_KEY"
 
 RPC_FALLBACK     = "https://api.mainnet-beta.solana.com"
 
-# Interval polling wallet (detik)
 TRACK_INTERVAL   = 10
 
 SKIP_MINTS = {
-    "So11111111111111111111111111111111111111112",   # wSOL
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",   # USDC
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",   # USDT
-    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",   # mSOL
-    "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y68YB",   # stSOL
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+    "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y68YB",
 }
 
-# Token info cache TTL (detik)
 TOKEN_CACHE_TTL = 300
 
 # ══════════════════════════════════════════════
@@ -58,7 +56,7 @@ TOKEN_CACHE_TTL = 300
 # ══════════════════════════════════════════════
 tracked_wallets = {}
 seen_sigs       = set()
-token_cache     = {}   # mint -> (info_dict, timestamp)
+token_cache     = {}
 _sol_price      = 150.0
 
 DATA_FILE      = os.path.join(os.path.dirname(__file__), "wallets.json")
@@ -193,7 +191,6 @@ def get_token_info(mint: str) -> dict:
 
 def poll_wallet(addr: str, label: str):
     sigs = rpc("getSignaturesForAddress", [addr, {"limit": 10}]) or []
-    # proses dari yang paling lama ke paling baru biar urutan notif benar
     for s in reversed(sigs):
         sig = s["signature"]
         if sig in seen_sigs:
@@ -205,31 +202,40 @@ def poll_wallet(addr: str, label: str):
         }])
         if not tx:
             continue
+
         meta     = tx.get("meta") or {}
         pre_tok  = meta.get("preTokenBalances",  []) or []
         post_tok = meta.get("postTokenBalances", []) or []
 
-        # cari index wallet di accountKeys buat hitung perubahan SOL
-        pre_sol = post_sol = 0
+        # Cari index wallet di accountKeys
         keys = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
+        wallet_indices = set()
+        pre_sol = post_sol = 0
         pre_bals  = meta.get("preBalances",  []) or []
         post_bals = meta.get("postBalances", []) or []
+
         for i, k in enumerate(keys):
             a = k if isinstance(k, str) else k.get("pubkey", "")
             if a == addr:
+                wallet_indices.add(i)
                 pre_sol  = pre_bals[i]  if i < len(pre_bals)  else 0
                 post_sol = post_bals[i] if i < len(post_bals) else 0
                 break
+
         sol_spent = max(0, (pre_sol - post_sol) / 1e9)
         sol_recv  = max(0, (post_sol - pre_sol) / 1e9)
 
+        # FIX: cek owner ATAU accountIndex match wallet
         def _build_map(balances):
             m = {}
             for p in balances:
-                if p.get("owner") != addr:
-                    continue
+                owner = p.get("owner", "")
+                acc_idx = p.get("accountIndex", -1)
                 mint = p.get("mint", "")
                 if mint in SKIP_MINTS:
+                    continue
+                # match jika owner = wallet ATAU accountIndex ada di wallet indices
+                if owner != addr and acc_idx not in wallet_indices:
                     continue
                 amt = float(p.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
                 m[mint] = m.get(mint, 0) + amt
@@ -237,6 +243,10 @@ def poll_wallet(addr: str, label: str):
 
         pre_map  = _build_map(pre_tok)
         post_map = _build_map(post_tok)
+
+        # skip kalau ga ada perubahan token sama sekali
+        if not pre_map and not post_map:
+            continue
 
         sol_price = _sol_price or get_sol_price()
 
@@ -307,9 +317,9 @@ def track_loop():
         return
     log(f"Track mode: monitoring {len(tracked_wallets)} wallet", "🎯 ")
     log(f"Poll tiap {TRACK_INTERVAL}s")
-    # seed signature lama biar ga spam notif transaksi historis saat pertama jalan
+    # seed hanya 1 tx terakhir biar ga miss tx baru
     for addr in tracked_wallets:
-        sigs = rpc("getSignaturesForAddress", [addr, {"limit": 10}]) or []
+        sigs = rpc("getSignaturesForAddress", [addr, {"limit": 1}]) or []
         for s in sigs:
             seen_sigs.add(s["signature"])
     log(f"Seeded {len(seen_sigs)} signature lama (skip notif historis)")
@@ -332,9 +342,8 @@ def run_loop():
     max_duration = 19800  # 5.5 jam
     cycle_count  = 0
 
-    # seed signature lama dulu
     for addr in tracked_wallets:
-        sigs = rpc("getSignaturesForAddress", [addr, {"limit": 10}]) or []
+        sigs = rpc("getSignaturesForAddress", [addr, {"limit": 1}]) or []
         for s in sigs:
             seen_sigs.add(s["signature"])
 
@@ -363,7 +372,6 @@ if __name__ == "__main__":
     load_seen()
     get_sol_price()
 
-    # tambahan wallet dari CLI arg
     cli_wallets = [a for a in sys.argv[1:] if len(a) >= 32 and not a.startswith("--")]
     for addr in cli_wallets:
         tracked_wallets[addr] = tracked_wallets.get(addr, f"CLI {addr[:8]}")
@@ -375,7 +383,6 @@ if __name__ == "__main__":
 
     if ci_mode:
         if ci_env == "false":
-            # jalan terus (long-running) di runner
             run_loop()
         else:
             tg(f"🤖 <b>Wallet Tracker CI</b> — {len(tracked_wallets)} wallet")
@@ -388,6 +395,5 @@ if __name__ == "__main__":
             save_seen()
             sys.exit(0)
 
-    # default: track terus-menerus secara lokal
     tg(f"🎯 <b>Wallet Tracker aktif</b> — Tracking {len(tracked_wallets)} wallet")
     track_loop()
