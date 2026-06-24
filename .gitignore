@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .env
 seen_*.json
+positions.json
+cluster.json
+tg_offset.json
