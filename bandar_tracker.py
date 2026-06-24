@@ -55,6 +55,7 @@ TRACK_INTERVAL   = 10
 
 # ── Filter & fitur (bisa di-override lewat .env) ──
 MIN_USD            = float(_cfg("MIN_USD", "30"))          # skip notif transaksi < segini
+TRADE_MIN_USD      = float(_cfg("TRADE_MIN_USD", "1"))     # di bawah ini = transfer, bukan swap
 CLUSTER_WINDOW_MIN = float(_cfg("CLUSTER_WINDOW_MIN", "30"))  # window cluster (menit)
 CLUSTER_MIN_WALLET = int(_cfg("CLUSTER_MIN_WALLET", "2"))  # min wallet biar dianggap cluster
 
@@ -585,9 +586,11 @@ def backfill_wallet(addr, limit=100):
         p = parse_tx(tx, addr, sol_price)
         for mint, delta in p["changes"].items():
             if delta > 0:
-                record_buy(addr, mint, p["usd_spent"], delta)
+                if p["usd_spent"] >= TRADE_MIN_USD:     # abaikan transfer/airdrop
+                    record_buy(addr, mint, p["usd_spent"], delta)
             else:
-                record_sell(addr, mint, p["usd_recv"], -delta)
+                if p["usd_recv"] >= TRADE_MIN_USD:      # abaikan transfer keluar
+                    record_sell(addr, mint, p["usd_recv"], -delta)
     backfilled.add(addr)
     n = len(positions.get(addr, {}))
     log(f"Backfill {_label_of(addr)}: {n} posisi dari {len(sigs)} tx", "📚 ")
@@ -621,8 +624,10 @@ def poll_wallet(addr: str, label: str):
         for mint, delta in p["changes"].items():
             # ── BUY (token bertambah) ──
             if delta > 0:
+                if usd_spent < TRADE_MIN_USD:            # transfer/airdrop, bukan beli beneran
+                    continue
                 got = delta
-                record_buy(addr, mint, usd_spent, got)   # akuntansi selalu jalan
+                record_buy(addr, mint, usd_spent, got)   # akuntansi
                 if usd_spent < MIN_USD:                   # skip notif receh
                     continue
 
@@ -654,8 +659,10 @@ def poll_wallet(addr: str, label: str):
 
             # ── SELL (token berkurang) ──
             else:
+                if usd_recv < TRADE_MIN_USD:            # transfer keluar, bukan jual beneran
+                    continue
                 sold_amt = -delta
-                pnl      = record_sell(addr, mint, usd_recv, sold_amt)  # akuntansi selalu jalan
+                pnl      = record_sell(addr, mint, usd_recv, sold_amt)  # akuntansi
                 if usd_recv < MIN_USD:
                     continue
 
