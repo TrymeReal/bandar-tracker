@@ -30,14 +30,13 @@ jobs:
             seen_sigs.json
             seen_mints.json
             mode.json
-            wallets.json
           key: bandar-tracker-${{ github.run_id }}
           restore-keys: bandar-tracker-
 
       - name: Run tracker
-        run: python bandar_tracker.py --ci --mode 7
+        run: python bandar_tracker.py --ci --mode 2
         env:
-          CI: 'true'
+          CI: 'false'
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TG_THREAD: ${{ secrets.TG_THREAD }}
