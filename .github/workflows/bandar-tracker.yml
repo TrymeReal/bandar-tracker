@@ -28,6 +28,9 @@ jobs:
         with:
           path: |
             seen_sigs.json
+            positions.json
+            cluster.json
+            tg_offset.json
           key: bandar-tracker-${{ github.run_id }}
           restore-keys: bandar-tracker-
 
