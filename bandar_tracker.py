@@ -4,8 +4,16 @@
 ║   Track wallet → notif BUY & SELL ke Telegram ║
 ╚══════════════════════════════════════════════╝
 
-Hanya 1 mode: track wallet yang ada di wallets.json.
+Track wallet yang ada di wallets.json.
 Setiap wallet BUY atau SELL token → kirim notif ke Telegram.
+
+Fitur:
+  • Deteksi BUY/SELL (bayar pakai SOL maupun USDC/USDT)
+  • PnL realized per wallet per token saat SELL
+  • Cluster alert 🚨 — 2+ wallet beli token sama dalam X menit
+  • Info anti-rug di notif (MarketCap / Liquidity / Age)
+  • Filter MIN_USD biar transaksi receh ga spam
+  • Perintah Telegram: /add /remove /list /help
 
   python bandar_tracker.py            → track semua wallet di wallets.json
   python bandar_tracker.py <wallet>   → track wallet tambahan dari CLI
@@ -13,6 +21,7 @@ Setiap wallet BUY atau SELL token → kirim notif ke Telegram.
 SETUP:
   pip install requests
   Isi .env (TG_TOKEN, TG_CHAT_ID, HELIUS_API_KEY)
+  Opsional .env: MIN_USD, CLUSTER_WINDOW_MIN, CLUSTER_MIN_WALLET, TG_THREAD
 """
 
 import json, time, sys, os, requests
@@ -31,20 +40,33 @@ if os.path.exists(_env_path):
                 k, v = line.split("=", 1)
                 _env[k.strip()] = v.strip()
 
-TELEGRAM_TOKEN   = _env.get("TG_TOKEN") or os.environ.get("TG_TOKEN", "")
-TELEGRAM_CHAT_ID = _env.get("TG_CHAT_ID") or os.environ.get("TG_CHAT_ID", "")
-TELEGRAM_THREAD  = int(_env.get("TG_THREAD") or os.environ.get("TG_THREAD") or "0")
+def _cfg(key, default=""):
+    return _env.get(key) or os.environ.get(key) or default
 
-HELIUS_API_KEY   = _env.get("HELIUS_API_KEY") or os.environ.get("HELIUS_API_KEY", "")
+TELEGRAM_TOKEN   = _cfg("TG_TOKEN")
+TELEGRAM_CHAT_ID = _cfg("TG_CHAT_ID")
+TELEGRAM_THREAD  = int(_cfg("TG_THREAD", "0"))
+
+HELIUS_API_KEY   = _cfg("HELIUS_API_KEY")
 
 RPC_FALLBACK     = "https://api.mainnet-beta.solana.com"
 
 TRACK_INTERVAL   = 10
 
+# ── Filter & fitur (bisa di-override lewat .env) ──
+MIN_USD            = float(_cfg("MIN_USD", "30"))          # skip notif transaksi < segini
+CLUSTER_WINDOW_MIN = float(_cfg("CLUSTER_WINDOW_MIN", "30"))  # window cluster (menit)
+CLUSTER_MIN_WALLET = int(_cfg("CLUSTER_MIN_WALLET", "2"))  # min wallet biar dianggap cluster
+
+SOL_MINT = "So11111111111111111111111111111111111111112"
+USDC     = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDT     = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+STABLE_MINTS = {USDC, USDT}
+
+# Token yang tidak dianggap sebagai "token yang dibeli/dijual"
+# (SOL/stablecoin/LST — ini sisi pembayaran, bukan target)
 SKIP_MINTS = {
-    "So11111111111111111111111111111111111111112",
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    SOL_MINT, USDC, USDT,
     "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
     "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y68YB",
 }
@@ -59,8 +81,16 @@ seen_sigs       = set()
 token_cache     = {}
 _sol_price      = 150.0
 
+positions       = {}   # {addr: {mint: {"usd_in": float, "tokens": float}}}
+recent_buys     = {}   # {mint: [[label, ts], ...]}   untuk deteksi cluster
+cluster_alerted = {}   # {mint: ts}                    biar ga spam cluster
+tg_offset       = 0    # offset getUpdates Telegram
+
 DATA_FILE      = os.path.join(os.path.dirname(__file__), "wallets.json")
 SEEN_SIGS_FILE = os.path.join(os.path.dirname(__file__), "seen_sigs.json")
+POSITIONS_FILE = os.path.join(os.path.dirname(__file__), "positions.json")
+CLUSTER_FILE   = os.path.join(os.path.dirname(__file__), "cluster.json")
+TG_OFFSET_FILE = os.path.join(os.path.dirname(__file__), "tg_offset.json")
 
 # ══════════════════════════════════════════════
 # UTILS
@@ -71,6 +101,28 @@ def esc(s): return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">"
 def log(msg, prefix=""):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {prefix}{msg}")
+
+def fmt_usd(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    if n >= 1e9: return f"${n/1e9:.1f}B"
+    if n >= 1e6: return f"${n/1e6:.1f}M"
+    if n >= 1e3: return f"${n/1e3:.1f}k"
+    return f"${n:.0f}"
+
+def fmt_age(created_ms):
+    if not created_ms:
+        return "?"
+    try:
+        secs = time.time() - float(created_ms) / 1000
+        if secs < 0:        return "?"
+        if secs < 3600:     return f"{int(secs // 60)}m"
+        if secs < 86400:    return f"{int(secs // 3600)}j"
+        return f"{int(secs // 86400)}h"
+    except Exception:
+        return "?"
 
 def rpc(method, params, url=None):
     endpoint = url or (
@@ -88,54 +140,111 @@ def rpc(method, params, url=None):
         return None
 
 def get_sol_price():
+    """Ambil harga SOL dgn beberapa fallback. Selalu return harga terakhir kalau semua gagal."""
     global _sol_price
+    # 1) Jupiter Price API v3 (endpoint publik gratis, tanpa API key)
     try:
-        r = requests.get("https://price.jup.ag/v4/price?ids=SOL", timeout=4)
-        _sol_price = float(r.json()["data"]["SOL"]["price"])
+        r = requests.get(f"https://lite-api.jup.ag/price/v3?ids={SOL_MINT}", timeout=5)
+        p = float(r.json()[SOL_MINT]["usdPrice"])
+        if p > 0:
+            _sol_price = p
+            return _sol_price
     except Exception as e:
-        log(f"Gagal ambil harga SOL: {e}", "⚠️ ")
+        log(f"Harga SOL (Jupiter) gagal: {e}", "⚠️ ")
+    # 2) CoinGecko
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+            timeout=5
+        )
+        p = float(r.json()["solana"]["usd"])
+        if p > 0:
+            _sol_price = p
+            return _sol_price
+    except Exception as e:
+        log(f"Harga SOL (CoinGecko) gagal: {e}", "⚠️ ")
+    # 3) DexScreener
+    try:
+        r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}", timeout=5)
+        p = float(r.json()["pairs"][0]["priceUsd"])
+        if p > 0:
+            _sol_price = p
+            return _sol_price
+    except Exception as e:
+        log(f"Harga SOL (DexScreener) gagal: {e}", "⚠️ ")
+    log(f"Semua sumber harga SOL gagal — pakai cache ${_sol_price:.2f}", "⚠️ ")
     return _sol_price
+
+# ══════════════════════════════════════════════
+# PERSISTENCE
+# ══════════════════════════════════════════════
+
+def _save_json(path, data, what):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log(f"Gagal save {what}: {e}", "⚠️ ")
+
+def _load_json(path, what, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:
+        log(f"Gagal load {what}: {e}", "⚠️ ")
+        return default
 
 def load_wallets():
     global tracked_wallets
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE) as f:
-                saved = json.load(f)
-            tracked_wallets.update(saved)
-            log(f"Loaded {len(saved)} wallet dari wallets.json")
-        except Exception as e:
-            log(f"Gagal load wallets: {e}", "⚠️ ")
+    saved = _load_json(DATA_FILE, "wallets", {})
+    if saved:
+        tracked_wallets.update(saved)
+        log(f"Loaded {len(saved)} wallet dari wallets.json")
 
 def save_wallets():
-    try:
-        with open(DATA_FILE, "w") as f:
-            json.dump(tracked_wallets, f, indent=2)
-    except Exception as e:
-        log(f"Gagal save wallets: {e}", "⚠️ ")
+    _save_json(DATA_FILE, tracked_wallets, "wallets")
 
 def save_seen():
-    try:
-        with open(SEEN_SIGS_FILE, "w") as f:
-            json.dump({"sigs": list(seen_sigs)[-5000:]}, f)
-    except Exception as e:
-        log(f"Gagal save seen_sigs: {e}", "⚠️ ")
+    _save_json(SEEN_SIGS_FILE, {"sigs": list(seen_sigs)[-5000:]}, "seen_sigs")
 
 def load_seen():
     global seen_sigs
-    if os.path.exists(SEEN_SIGS_FILE):
-        try:
-            with open(SEEN_SIGS_FILE) as f:
-                seen_sigs = set(json.load(f).get("sigs", []))
-            log(f"Loaded {len(seen_sigs)} seen sigs")
-        except Exception as e:
-            log(f"Gagal load seen_sigs: {e}", "⚠️ ")
+    data = _load_json(SEEN_SIGS_FILE, "seen_sigs", {})
+    seen_sigs = set(data.get("sigs", []))
+    if seen_sigs:
+        log(f"Loaded {len(seen_sigs)} seen sigs")
+
+def save_state():
+    _save_json(POSITIONS_FILE, {"positions": positions}, "positions")
+    _save_json(CLUSTER_FILE,
+               {"recent_buys": recent_buys, "cluster_alerted": cluster_alerted},
+               "cluster")
+
+def load_state():
+    global positions, recent_buys, cluster_alerted
+    positions = _load_json(POSITIONS_FILE, "positions", {}).get("positions", {})
+    c = _load_json(CLUSTER_FILE, "cluster", {})
+    recent_buys     = c.get("recent_buys", {})
+    cluster_alerted = c.get("cluster_alerted", {})
+    if positions:
+        log(f"Loaded posisi {sum(len(v) for v in positions.values())} token")
+
+def save_tg_offset():
+    _save_json(TG_OFFSET_FILE, {"offset": tg_offset}, "tg_offset")
+
+def load_tg_offset():
+    global tg_offset
+    tg_offset = _load_json(TG_OFFSET_FILE, "tg_offset", {}).get("offset", 0)
 
 # ══════════════════════════════════════════════
 # TELEGRAM
 # ══════════════════════════════════════════════
 
 def tg(msg: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     try:
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
@@ -154,8 +263,121 @@ def tg(msg: str):
     except Exception as e:
         log(f"Telegram error: {e}", "❌ ")
 
+def _label_of(w):
+    l = tracked_wallets.get(w)
+    if isinstance(l, str):
+        return l
+    if isinstance(l, dict):
+        return l.get("label", w[:8])
+    return w[:8]
+
+def handle_command(text: str):
+    parts = text.split()
+    cmd  = parts[0].lower().lstrip("/").split("@")[0]
+    args = parts[1:]
+
+    if cmd in ("start", "help"):
+        tg("🤖 <b>Perintah Wallet Tracker</b>\n"
+           "/add &lt;wallet&gt; [nama] — tambah wallet\n"
+           "/remove &lt;wallet|nama&gt; — hapus wallet\n"
+           "/list — daftar wallet di-track")
+
+    elif cmd == "add":
+        if not args:
+            tg("Format: <code>/add &lt;wallet&gt; [nama]</code>"); return
+        w = args[0]
+        if len(w) < 32:
+            tg("❌ Alamat wallet tidak valid"); return
+        label  = " ".join(args[1:]) or f"W {w[:4]}"
+        is_new = w not in tracked_wallets
+        tracked_wallets[w] = label
+        save_wallets()
+        # seed signature terakhir biar ga kirim notif historis
+        for s in (rpc("getSignaturesForAddress", [w, {"limit": 1}]) or []):
+            seen_sigs.add(s["signature"])
+        tg(f"{'✅ Ditambahkan' if is_new else '✏️ Diperbarui'}: <b>{esc(label)}</b>\n"
+           f"<code>{esc(w)}</code>")
+        log(f"CMD add: {label} ({w[:8]})", "💬 ")
+
+    elif cmd in ("remove", "rm", "del"):
+        if not args:
+            tg("Format: <code>/remove &lt;wallet|nama&gt;</code>"); return
+        q = args[0]
+        target = q if q in tracked_wallets else None
+        if not target:
+            for a in tracked_wallets:
+                if _label_of(a).lower() == q.lower():
+                    target = a; break
+        if target:
+            lbl = _label_of(target)
+            tracked_wallets.pop(target)
+            save_wallets()
+            tg(f"🗑️ Dihapus: <b>{esc(lbl)}</b>")
+            log(f"CMD remove: {lbl}", "💬 ")
+        else:
+            tg("❌ Wallet tidak ditemukan")
+
+    elif cmd in ("list", "ls"):
+        if not tracked_wallets:
+            tg("📋 Belum ada wallet yang di-track."); return
+        lines = ["📋 <b>Wallet di-track</b>:"]
+        for a in tracked_wallets:
+            lines.append(f"• <b>{esc(_label_of(a))}</b> — <code>{esc(a)}</code>")
+        tg("\n".join(lines))
+
+    else:
+        tg(f"❓ Perintah tidak dikenal: <code>/{esc(cmd)}</code>\nKetik /help")
+
+def poll_telegram_commands():
+    """Cek pesan masuk → proses perintah /add /remove /list."""
+    global tg_offset
+    if not TELEGRAM_TOKEN:
+        return
+    try:
+        params = {"timeout": 0, "allowed_updates": json.dumps(["message"])}
+        if tg_offset:
+            params["offset"] = tg_offset
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params=params, timeout=15
+        )
+        data = r.json()
+        if not data.get("ok"):
+            return
+        for upd in data.get("result", []):
+            tg_offset = upd["update_id"] + 1
+            msg  = upd.get("message") or {}
+            chat = str(msg.get("chat", {}).get("id", ""))
+            text = (msg.get("text") or "").strip()
+            if not text.startswith("/"):
+                continue
+            # hanya proses perintah dari chat yang dikonfigurasi
+            if TELEGRAM_CHAT_ID and chat != str(TELEGRAM_CHAT_ID):
+                continue
+            handle_command(text)
+        save_tg_offset()
+    except Exception as e:
+        log(f"getUpdates error: {e}", "⚠️ ")
+
+def seed_tg_offset():
+    """Buang backlog perintah lama saat pertama jalan (kalau belum ada offset tersimpan)."""
+    global tg_offset
+    if tg_offset or not TELEGRAM_TOKEN:
+        return
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params={"timeout": 0}, timeout=10
+        )
+        res = r.json().get("result", [])
+        if res:
+            tg_offset = res[-1]["update_id"] + 1
+            save_tg_offset()
+    except Exception:
+        pass
+
 # ══════════════════════════════════════════════
-# TOKEN INFO
+# TOKEN INFO (+ info anti-rug)
 # ══════════════════════════════════════════════
 
 def get_token_info(mint: str) -> dict:
@@ -165,25 +387,85 @@ def get_token_info(mint: str) -> dict:
         if now - cached_ts < TOKEN_CACHE_TTL:
             return cached_info
 
+    info = {
+        "name":   mint[:8] + "...", "symbol": "???", "price": "?",
+        "liq": None, "mcap": None, "age": "?",
+        "dex_url": f"https://dexscreener.com/solana/{mint}",
+    }
     try:
         r = requests.get(
-            f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-            timeout=5
+            f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5
         )
-        pair = r.json().get("pairs", [{}])[0]
-        info = {
-            "name":    pair.get("baseToken", {}).get("name", mint[:8] + "..."),
+        pairs = r.json().get("pairs") or [{}]
+        pair  = pairs[0]
+        info.update({
+            "name":    pair.get("baseToken", {}).get("name", info["name"]),
             "symbol":  pair.get("baseToken", {}).get("symbol", "???"),
             "price":   pair.get("priceUsd", "?"),
-            "dex_url": pair.get("url", f"https://dexscreener.com/solana/{mint}"),
-        }
+            "liq":     (pair.get("liquidity") or {}).get("usd"),
+            "mcap":    pair.get("marketCap") or pair.get("fdv"),
+            "age":     fmt_age(pair.get("pairCreatedAt")),
+            "dex_url": pair.get("url", info["dex_url"]),
+        })
     except Exception as e:
         log(f"Gagal ambil token info {mint[:8]}: {e}", "⚠️ ")
-        info = {"name": mint[:8] + "...", "symbol": "???", "price": "?",
-                "dex_url": f"https://dexscreener.com/solana/{mint}"}
 
     token_cache[mint] = (info, now)
     return info
+
+def meta_line(info: dict) -> str:
+    """Baris 'MC: $.. | Liq: $.. | Age: ..' untuk notif."""
+    bits = []
+    if info.get("mcap"): bits.append(f"MC {fmt_usd(info['mcap'])}")
+    if info.get("liq"):  bits.append(f"Liq {fmt_usd(info['liq'])}")
+    if info.get("age") and info["age"] != "?": bits.append(f"Age {info['age']}")
+    return " | ".join(bits)
+
+# ══════════════════════════════════════════════
+# PnL (cost-basis per wallet per token, dalam USD)
+# ══════════════════════════════════════════════
+
+def record_buy(addr, mint, usd, tokens):
+    pos = positions.setdefault(addr, {}).setdefault(mint, {"usd_in": 0.0, "tokens": 0.0})
+    pos["usd_in"] += max(0.0, usd)
+    pos["tokens"] += max(0.0, tokens)
+
+def record_sell(addr, mint, usd_recv, sold_tokens):
+    """Update posisi, return dict PnL realized atau None kalau cost basis tak diketahui."""
+    pos = positions.get(addr, {}).get(mint)
+    if not pos or pos["tokens"] <= 0:
+        return None
+    frac = min(1.0, sold_tokens / pos["tokens"]) if pos["tokens"] else 1.0
+    cost = pos["usd_in"] * frac
+    pos["usd_in"]  -= cost
+    pos["tokens"]  -= sold_tokens
+    if pos["tokens"] < 1e-9:
+        pos["tokens"] = 0.0
+        pos["usd_in"] = 0.0
+    if cost <= 0:
+        return None
+    pnl = usd_recv - cost
+    return {"cost": cost, "pnl": pnl, "pct": pnl / cost * 100}
+
+# ══════════════════════════════════════════════
+# CLUSTER (bandar masuk bareng)
+# ══════════════════════════════════════════════
+
+def note_buy_for_cluster(mint, label):
+    """Catat buy. Return list wallet kalau jadi cluster baru, else None."""
+    now    = time.time()
+    window = CLUSTER_WINDOW_MIN * 60
+    lst = recent_buys.setdefault(mint, [])
+    lst.append([label, now])
+    recent_buys[mint] = [e for e in lst if now - e[1] <= window]  # prune
+
+    distinct = sorted({e[0] for e in recent_buys[mint]})
+    if len(distinct) >= CLUSTER_MIN_WALLET:
+        last = cluster_alerted.get(mint, 0)
+        if now - last > window:           # belum pernah alert / window sudah lewat
+            cluster_alerted[mint] = now
+            return distinct
+    return None
 
 # ══════════════════════════════════════════════
 # TRACK MODE — deteksi BUY & SELL
@@ -207,7 +489,7 @@ def poll_wallet(addr: str, label: str):
         pre_tok  = meta.get("preTokenBalances",  []) or []
         post_tok = meta.get("postTokenBalances", []) or []
 
-        # Cari index wallet di accountKeys
+        # Cari index wallet di accountKeys + perubahan saldo SOL
         keys = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
         wallet_indices = set()
         pre_sol = post_sol = 0
@@ -225,39 +507,60 @@ def poll_wallet(addr: str, label: str):
         sol_spent = max(0, (pre_sol - post_sol) / 1e9)
         sol_recv  = max(0, (post_sol - pre_sol) / 1e9)
 
-        # FIX: cek owner ATAU accountIndex match wallet
-        def _build_map(balances):
+        def _delta(balances, only=None, skip=None):
             m = {}
             for p in balances:
-                owner = p.get("owner", "")
+                owner   = p.get("owner", "")
                 acc_idx = p.get("accountIndex", -1)
-                mint = p.get("mint", "")
-                if mint in SKIP_MINTS:
+                mint    = p.get("mint", "")
+                if only is not None and mint not in only:
                     continue
-                # match jika owner = wallet ATAU accountIndex ada di wallet indices
+                if skip is not None and mint in skip:
+                    continue
                 if owner != addr and acc_idx not in wallet_indices:
                     continue
                 amt = float(p.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
                 m[mint] = m.get(mint, 0) + amt
             return m
 
-        pre_map  = _build_map(pre_tok)
-        post_map = _build_map(post_tok)
+        # token target (exclude SOL/stable/LST)
+        pre_map  = _delta(pre_tok,  skip=SKIP_MINTS)
+        post_map = _delta(post_tok, skip=SKIP_MINTS)
+        # stablecoin (buat ngitung USD kalau bayar pakai USDC/USDT)
+        pre_stab  = _delta(pre_tok,  only=STABLE_MINTS)
+        post_stab = _delta(post_tok, only=STABLE_MINTS)
 
-        # skip kalau ga ada perubahan token sama sekali
         if not pre_map and not post_map:
             continue
 
+        all_stab     = set(pre_stab) | set(post_stab)
+        stable_spent = sum(max(0, pre_stab.get(m, 0)  - post_stab.get(m, 0)) for m in all_stab)
+        stable_recv  = sum(max(0, post_stab.get(m, 0) - pre_stab.get(m, 0))  for m in all_stab)
+
         sol_price = _sol_price or get_sol_price()
+        usd_spent = sol_spent * sol_price + stable_spent
+        usd_recv  = sol_recv  * sol_price + stable_recv
+
+        def _spend_str(sol_amt, usd):
+            if sol_amt * sol_price >= 0.01:
+                return f"{sol_amt:.3f} SOL (~${usd:,.0f})"
+            return f"${usd:,.0f} (stablecoin)"
 
         # ── DETECT BUY (token bertambah) ──
         for mint, post_amt in post_map.items():
             pre_amt = pre_map.get(mint, 0)
             if post_amt <= pre_amt:
                 continue
-            usd_val = sol_spent * sol_price
-            info = get_token_info(mint)
-            log(f"{label} BUY ${info['symbol']} {sol_spent:.3f}SOL (~${usd_val:,.0f})", "🟢 ")
+            got = post_amt - pre_amt
+            record_buy(addr, mint, usd_spent, got)   # akuntansi selalu jalan
+
+            if usd_spent < MIN_USD:                   # skip notif receh
+                continue
+
+            info    = get_token_info(mint)
+            cluster = note_buy_for_cluster(mint, label)
+            metas   = meta_line(info)
+            log(f"{label} BUY ${info['symbol']} ~${usd_spent:,.0f}", "🟢 ")
             msg = (
                 f"🟢 <b>BUY</b>\n"
                 f"━━━━━━━━━━━━━━━━━\n\n"
@@ -265,14 +568,19 @@ def poll_wallet(addr: str, label: str):
                 f"<code>{esc(addr)}</code>\n\n"
                 f"<b>Token</b>: ${esc(info['symbol'])} ({esc(info['name'])})\n"
                 f"<b>CA</b>: <code>{esc(mint)}</code>\n"
-                f"<b>Amount</b>: {sol_spent:.3f} SOL (~${usd_val:,.0f})\n"
-                f"<b>Got</b>: {post_amt - pre_amt:,.4f} token\n"
-                f"<b>Price</b>: ${esc(info['price'])}\n\n"
+                f"<b>Amount</b>: {_spend_str(sol_spent, usd_spent)}\n"
+                f"<b>Got</b>: {got:,.4f} token\n"
+                f"<b>Price</b>: ${esc(info['price'])}\n"
+                + (f"{esc(metas)}\n" if metas else "")
+                + f"\n"
                 f"<a href='https://solscan.io/tx/{esc(sig)}'>TX</a> | "
                 f"<a href='{esc(info['dex_url'])}'>DexScreener</a> | "
                 f"<a href='https://gmgn.ai/sol/address/{esc(addr)}'>GMGN</a>"
             )
             tg(msg)
+
+            if cluster:
+                send_cluster_alert(mint, info, cluster)
 
         # ── DETECT SELL (token berkurang) ──
         for mint, pre_amt in pre_map.items():
@@ -280,9 +588,18 @@ def poll_wallet(addr: str, label: str):
             if post_amt >= pre_amt:
                 continue
             sold_amt = pre_amt - post_amt
-            usd_val  = sol_recv * sol_price
+            pnl      = record_sell(addr, mint, usd_recv, sold_amt)  # akuntansi selalu jalan
+
+            if usd_recv < MIN_USD:
+                continue
+
             info = get_token_info(mint)
-            log(f"{label} SELL {sold_amt:.4f} {info['symbol']} (~${usd_val:,.0f})", "🔴 ")
+            if pnl:
+                sign    = "🟢" if pnl["pnl"] >= 0 else "🔴"
+                pnl_str = f"\n<b>PnL</b>: {sign} {pnl['pct']:+.0f}% (${pnl['pnl']:+,.0f})"
+            else:
+                pnl_str = ""
+            log(f"{label} SELL {sold_amt:.4f} {info['symbol']} ~${usd_recv:,.0f}", "🔴 ")
             msg = (
                 f"🔴 <b>SELL</b>\n"
                 f"━━━━━━━━━━━━━━━━━\n\n"
@@ -291,41 +608,70 @@ def poll_wallet(addr: str, label: str):
                 f"<b>Token</b>: ${esc(info['symbol'])} ({esc(info['name'])})\n"
                 f"<b>CA</b>: <code>{esc(mint)}</code>\n"
                 f"<b>Sold</b>: {sold_amt:,.4f} token\n"
-                f"<b>Got</b>: {sol_recv:.3f} SOL (~${usd_val:,.0f})\n"
-                f"<b>Price</b>: ${esc(info['price'])}\n\n"
+                f"<b>Got</b>: {_spend_str(sol_recv, usd_recv)}\n"
+                f"<b>Price</b>: ${esc(info['price'])}"
+                f"{pnl_str}\n\n"
                 f"<a href='https://solscan.io/tx/{esc(sig)}'>TX</a> | "
                 f"<a href='{esc(info['dex_url'])}'>DexScreener</a> | "
                 f"<a href='https://gmgn.ai/sol/address/{esc(addr)}'>GMGN</a>"
             )
             tg(msg)
 
+def send_cluster_alert(mint, info, wallets):
+    log(f"CLUSTER {len(wallets)} wallet → ${info['symbol']}", "🚨 ")
+    metas = meta_line(info)
+    msg = (
+        f"🚨🚨 <b>BANDAR MASUK BARENG</b> 🚨🚨\n"
+        f"━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>{len(wallets)} wallet</b> beli ${esc(info['symbol'])} "
+        f"({esc(info['name'])}) dalam {int(CLUSTER_WINDOW_MIN)} menit!\n\n"
+        f"<b>Wallets</b>: {esc(', '.join(wallets))}\n"
+        f"<b>CA</b>: <code>{esc(mint)}</code>\n"
+        f"<b>Price</b>: ${esc(info['price'])}\n"
+        + (f"{esc(metas)}\n" if metas else "")
+        + f"\n"
+        f"<a href='{esc(info['dex_url'])}'>DexScreener</a> | "
+        f"<a href='https://gmgn.ai/sol/token/{esc(mint)}'>GMGN</a>"
+    )
+    tg(msg)
+
 def track_once():
     if not tracked_wallets:
         log("Tidak ada wallet yang di-track.", "⚠️ ")
         return
     log(f"🎯 Cek {len(tracked_wallets)} wallet...", "🎯 ")
-    for addr, label in list(tracked_wallets.items()):
+    for addr in list(tracked_wallets.keys()):
         try:
-            poll_wallet(addr, label if isinstance(label, str) else label.get("label", addr[:8]))
+            poll_wallet(addr, _label_of(addr))
         except Exception as e:
             log(f"Error polling {addr[:8]}: {e}", "❌ ")
     log("🎯 Selesai cek wallet", "🎯 ")
+
+def _seed_seen():
+    """Seed 1 tx terakhir tiap wallet biar ga notif historis."""
+    for addr in tracked_wallets:
+        for s in (rpc("getSignaturesForAddress", [addr, {"limit": 1}]) or []):
+            seen_sigs.add(s["signature"])
 
 def track_loop():
     if not tracked_wallets:
         log("Tidak ada wallet di wallets.json. Isi dulu.", "⚠️ ")
         return
     log(f"Track mode: monitoring {len(tracked_wallets)} wallet", "🎯 ")
-    log(f"Poll tiap {TRACK_INTERVAL}s")
-    # seed hanya 1 tx terakhir biar ga miss tx baru
-    for addr in tracked_wallets:
-        sigs = rpc("getSignaturesForAddress", [addr, {"limit": 1}]) or []
-        for s in sigs:
-            seen_sigs.add(s["signature"])
+    log(f"Poll tiap {TRACK_INTERVAL}s | MIN_USD=${MIN_USD:.0f} | "
+        f"cluster={CLUSTER_MIN_WALLET} wallet/{int(CLUSTER_WINDOW_MIN)}m")
+    _seed_seen()
+    seed_tg_offset()
     log(f"Seeded {len(seen_sigs)} signature lama (skip notif historis)")
+    cycle = 0
     while True:
+        cycle += 1
+        if cycle % 30 == 1:           # refresh harga SOL ~tiap 5 menit
+            get_sol_price()
+        poll_telegram_commands()
         track_once()
         save_seen()
+        save_state()
         time.sleep(TRACK_INTERVAL)
 
 # ══════════════════════════════════════════════
@@ -334,20 +680,21 @@ def track_loop():
 
 def ci_run():
     log("CI mode — track once", "🤖 ")
+    poll_telegram_commands()
     track_once()
     save_seen()
+    save_state()
 
 def run_loop():
     start_time   = time.time()
     max_duration = 19800  # 5.5 jam
     cycle_count  = 0
 
-    for addr in tracked_wallets:
-        sigs = rpc("getSignaturesForAddress", [addr, {"limit": 1}]) or []
-        for s in sigs:
-            seen_sigs.add(s["signature"])
+    _seed_seen()
+    seed_tg_offset()
 
-    tg(f"🤖 <b>Wallet Tracker aktif</b> — {len(tracked_wallets)} wallet, max {max_duration//3600}j")
+    tg(f"🤖 <b>Wallet Tracker aktif</b> — {len(tracked_wallets)} wallet, "
+       f"max {max_duration//3600}j")
     log(f"🔄 Continuous loop — interval={TRACK_INTERVAL}s, max={max_duration//3600}j")
     while True:
         elapsed = time.time() - start_time
@@ -355,12 +702,17 @@ def run_loop():
             log(f"⏰ Timeout ({elapsed:.0f}s), {cycle_count} cycle")
             break
         cycle_count += 1
+        if cycle_count % 30 == 1:
+            get_sol_price()
+        poll_telegram_commands()
         track_once()
         save_seen()
+        save_state()
         if time.time() - start_time >= max_duration:
             break
         time.sleep(TRACK_INTERVAL)
     save_seen()
+    save_state()
     sys.exit(0)
 
 # ══════════════════════════════════════════════
@@ -370,6 +722,8 @@ def run_loop():
 if __name__ == "__main__":
     load_wallets()
     load_seen()
+    load_state()
+    load_tg_offset()
     get_sol_price()
 
     cli_wallets = [a for a in sys.argv[1:] if len(a) >= 32 and not a.startswith("--")]
@@ -393,6 +747,7 @@ if __name__ == "__main__":
             except Exception as e:
                 log(f"CI error: {e}", "❌ ")
             save_seen()
+            save_state()
             sys.exit(0)
 
     tg(f"🎯 <b>Wallet Tracker aktif</b> — Tracking {len(tracked_wallets)} wallet")
