@@ -24,7 +24,7 @@ SETUP:
   Opsional .env: MIN_USD, CLUSTER_WINDOW_MIN, CLUSTER_MIN_WALLET, TG_THREAD
 """
 
-import json, time, sys, os, requests
+import json, time, sys, os, requests, base64
 from datetime import datetime
 
 # ══════════════════════════════════════════════
@@ -48,6 +48,9 @@ TELEGRAM_CHAT_ID = _cfg("TG_CHAT_ID")
 TELEGRAM_THREAD  = int(_cfg("TG_THREAD", "0"))
 
 HELIUS_API_KEY   = _cfg("HELIUS_API_KEY")
+GH_TOKEN         = _cfg("GH_TOKEN")
+GITHUB_REPOSITORY = _cfg("GITHUB_REPOSITORY")
+GITHUB_BRANCH     = _cfg("GITHUB_REF_NAME", "main")
 
 RPC_FALLBACK     = "https://api.mainnet-beta.solana.com"
 
@@ -207,8 +210,43 @@ def load_wallets():
         tracked_wallets.update(saved)
         log(f"Loaded {len(saved)} wallet dari wallets.json")
 
+def _save_wallets_github():
+    """Persist wallets.json ke branch repo saat jalan di GitHub Actions."""
+    if not GH_TOKEN or not GITHUB_REPOSITORY:
+        return True
+    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/contents/wallets.json"
+    headers = {
+        "Authorization": f"Bearer {GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    raw = json.dumps(tracked_wallets, indent=2, ensure_ascii=False) + "\n"
+    encoded = base64.b64encode(raw.encode()).decode()
+    for attempt in range(2):
+        try:
+            current = requests.get(url, headers=headers,
+                                   params={"ref": GITHUB_BRANCH}, timeout=10)
+            current.raise_for_status()
+            result = requests.put(url, headers=headers, json={
+                "message": "chore: update tracked wallets from Telegram",
+                "content": encoded,
+                "sha": current.json()["sha"],
+                "branch": GITHUB_BRANCH,
+            }, timeout=15)
+            if result.ok:
+                log("wallets.json tersimpan permanen ke GitHub", "SAVE ")
+                return True
+            if result.status_code not in (409, 422) or attempt == 1:
+                log(f"GitHub save error: {result.status_code} {result.text[:200]}", "ERROR ")
+                return False
+        except Exception as e:
+            log(f"GitHub save error: {e}", "ERROR ")
+            return False
+    return False
+
 def save_wallets():
     _save_json(DATA_FILE, tracked_wallets, "wallets")
+    return _save_wallets_github()
 
 def save_seen():
     _save_json(SEEN_SIGS_FILE, {"sigs": list(seen_sigs)[-5000:]}, "seen_sigs")
@@ -300,8 +338,16 @@ def handle_command(text: str):
             tg("❌ Alamat wallet tidak valid"); return
         label  = " ".join(args[1:]) or f"W {w[:4]}"
         is_new = w not in tracked_wallets
+        old_value = tracked_wallets.get(w)
         tracked_wallets[w] = label
-        save_wallets()
+        if not save_wallets():
+            if is_new:
+                tracked_wallets.pop(w, None)
+            else:
+                tracked_wallets[w] = old_value
+            _save_json(DATA_FILE, tracked_wallets, "wallets")
+            tg("❌ Gagal menyimpan wallet permanen. Coba lagi.")
+            return
         # backfill cost-basis + seed seen_sigs (skip notif historis)
         try:
             backfill_wallet(w)
@@ -322,8 +368,12 @@ def handle_command(text: str):
                     target = a; break
         if target:
             lbl = _label_of(target)
-            tracked_wallets.pop(target)
-            save_wallets()
+            old_value = tracked_wallets.pop(target)
+            if not save_wallets():
+                tracked_wallets[target] = old_value
+                _save_json(DATA_FILE, tracked_wallets, "wallets")
+                tg("❌ Gagal menyimpan perubahan permanen. Coba lagi.")
+                return
             tg(f"🗑️ Dihapus: <b>{esc(lbl)}</b>")
             log(f"CMD remove: {lbl}", "💬 ")
         else:

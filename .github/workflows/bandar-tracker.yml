@@ -5,6 +5,9 @@ on:
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 concurrency:
   group: bandar-tracker
   cancel-in-progress: false
@@ -42,3 +45,4 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TG_THREAD: ${{ secrets.TG_THREAD }}
           HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
